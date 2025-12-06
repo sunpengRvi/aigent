@@ -1,0 +1,20 @@
+FROM ./my_agent_14b_q4_k_m.gguf
+
+# 设置默认参数，降低随机性，提高指令遵循
+PARAMETER temperature 0.1
+PARAMETER top_p 0.9
+PARAMETER stop "<|im_end|>"
+PARAMETER stop "<|endoftext|>"
+
+# 设置系统提示词模板 (适配 DeepSeek/Qwen 格式)
+TEMPLATE """<|im_start|>system
+{{ .System }}<|im_end|>
+<|im_start|>user
+{{ .Prompt }}<|im_end|>
+<|im_start|>assistant
+"""
+
+SYSTEM """
+You are an intelligent web automation agent.
+Your output must be strictly JSON format: {"action": "...", "id": "..."}
+"""

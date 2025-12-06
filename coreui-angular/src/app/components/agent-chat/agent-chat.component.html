@@ -1,0 +1,57 @@
+<div class="agent-chat-container" cdkDrag cdkDragBoundary="body" [class.minimized]="isMinimized">
+  
+  <div class="chat-header" cdkDragHandle>
+    <div class="header-title">
+        <span *ngIf="!isMinimized">🤖 AI Assistant</span>
+        <span *ngIf="isMinimized">🤖</span>
+        
+        <span *ngIf="!isMinimized" class="status-text" [class.offline]="!isConnected">
+            {{ connectionStatus }}
+        </span>
+    </div>
+    
+    <div class="header-actions">
+      <button *ngIf="autoRunning && !isMinimized" class="btn-stop" (click)="stopAutoRun('User stopped'); $event.stopPropagation()">
+        ⏹ Stop
+      </button>
+
+      <button *ngIf="!isMinimized && !autoRunning" class="btn-record" [class.recording]="isRecording" (click)="toggleRecording(); $event.stopPropagation()">
+        {{ isRecording ? '⏹ Stop' : '🔴 Record' }}
+      </button>
+
+      <button class="btn-icon" (click)="toggleMinimize($event)" title="{{ isMinimized ? 'Expand' : 'Minimize' }}" (mousedown)="$event.stopPropagation()">
+        {{ isMinimized ? '⬜' : '➖' }}
+      </button>
+    </div>
+  </div>
+
+  <div class="chat-body" *ngIf="!isMinimized">
+    
+    <div class="mode-switcher" *ngIf="!isRecording && !autoRunning">
+      <button [class.active]="currentMode === 'chat'" (click)="setMode('chat')">💬 Chat Mode</button>
+      <button [class.active]="currentMode === 'task'" (click)="setMode('task')">⚡ Task Mode</button>
+    </div>
+
+    <div class="messages">
+      <div *ngFor="let msg of messages" class="msg" [ngClass]="msg.type">
+        <div>{{ msg.text }}</div>
+        
+        <div *ngIf="msg.type === 'agent' && msg.actionData" class="feedback-actions">
+          <button [class.active]="msg.feedback === 'good'" (click)="sendFeedback(msg.id, 'good', msg.actionData)">👍</button>
+          <button [class.active]="msg.feedback === 'bad'" (click)="sendFeedback(msg.id, 'bad', msg.actionData)">👎</button>
+        </div>
+      </div>
+    </div>
+    
+    <div class="input-area">
+      <input [(ngModel)]="inputText" 
+             (keyup.enter)="send()" 
+             [placeholder]="currentMode === 'chat' ? 'Ask me about the page...' : 'Enter command (e.g., Click Settings)...'" 
+             [disabled]="autoRunning">
+      
+      <button class="btn-send" (click)="send()" [disabled]="!inputText.trim() || autoRunning">
+        Send
+      </button>
+    </div>
+  </div>
+</div>
