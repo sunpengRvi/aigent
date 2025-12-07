@@ -4,7 +4,6 @@
     <div class="header-title">
         <span *ngIf="!isMinimized">🤖 AI Assistant</span>
         <span *ngIf="isMinimized">🤖</span>
-        
         <span *ngIf="!isMinimized" class="status-text" [class.offline]="!isConnected">
             {{ connectionStatus }}
         </span>
@@ -15,7 +14,7 @@
         ⏹ Stop
       </button>
 
-      <button *ngIf="!isMinimized && !autoRunning" class="btn-record" [class.recording]="isRecording" (click)="toggleRecording(); $event.stopPropagation()">
+      <button *ngIf="!isMinimized && !autoRunning && !isReviewing" class="btn-record" [class.recording]="isRecording" (click)="toggleRecording(); $event.stopPropagation()">
         {{ isRecording ? '⏹ Stop' : '🔴 Record' }}
       </button>
 
@@ -27,6 +26,33 @@
 
   <div class="chat-body" *ngIf="!isMinimized">
     
+    <div class="review-overlay" *ngIf="isReviewing">
+      <div class="review-header">
+        <span>Review: {{ reviewTaskName }}</span>
+        <span style="font-size: 11px; font-weight: normal;">{{ reviewSteps.length }} steps</span>
+      </div>
+      
+      <div class="review-list">
+        <div class="review-item" *ngFor="let step of reviewSteps; let i = index">
+          <span class="step-num">#{{ i + 1 }}</span>
+          <div class="step-desc">
+            <strong>{{ step.action.type | uppercase }}</strong>: 
+            {{ step.element_desc }}
+            <span *ngIf="step.action.value"> (Val: {{ step.action.value }})</span>
+          </div>
+          <button class="step-del-btn" (click)="removeStep(i)" title="Delete step">✖</button>
+        </div>
+        <div *ngIf="reviewSteps.length === 0" style="text-align: center; padding: 20px; color: #999;">
+          No steps recorded.
+        </div>
+      </div>
+      
+      <div class="review-footer">
+        <button class="btn-cancel" (click)="cancelSave()">Discard</button>
+        <button class="btn-confirm" (click)="confirmSave()" [disabled]="reviewSteps.length === 0">Save Demo</button>
+      </div>
+    </div>
+
     <div class="mode-switcher" *ngIf="!isRecording && !autoRunning">
       <button [class.active]="currentMode === 'chat'" (click)="setMode('chat')">💬 Chat Mode</button>
       <button [class.active]="currentMode === 'task'" (click)="setMode('task')">⚡ Task Mode</button>
@@ -35,7 +61,6 @@
     <div class="messages">
       <div *ngFor="let msg of messages" class="msg" [ngClass]="msg.type">
         <div>{{ msg.text }}</div>
-        
         <div *ngIf="msg.type === 'agent' && msg.actionData" class="feedback-actions">
           <button [class.active]="msg.feedback === 'good'" (click)="sendFeedback(msg.id, 'good', msg.actionData)">👍</button>
           <button [class.active]="msg.feedback === 'bad'" (click)="sendFeedback(msg.id, 'bad', msg.actionData)">👎</button>
@@ -46,10 +71,10 @@
     <div class="input-area">
       <input [(ngModel)]="inputText" 
              (keyup.enter)="send()" 
-             [placeholder]="currentMode === 'chat' ? 'Ask me about the page...' : 'Enter command (e.g., Click Settings)...'" 
-             [disabled]="autoRunning">
+             [placeholder]="currentMode === 'chat' ? 'Ask about page...' : 'Enter command...'" 
+             [disabled]="autoRunning || isReviewing">
       
-      <button class="btn-send" (click)="send()" [disabled]="!inputText.trim() || autoRunning">
+      <button class="btn-send" (click)="send()" [disabled]="!inputText.trim() || autoRunning || isReviewing">
         Send
       </button>
     </div>

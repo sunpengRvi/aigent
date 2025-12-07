@@ -292,3 +292,105 @@ input:focus {
   50% { opacity: 0.7; }
   100% { opacity: 1; }
 }
+
+/* 🔥 Review Overlay */
+.review-overlay {
+  position: absolute;
+  top: 48px; /* Height of header */
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: #fff;
+  z-index: 10; /* Cover messages */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.review-header {
+  padding: 10px;
+  background: #f0f3f5;
+  border-bottom: 1px solid #ddd;
+  font-weight: bold;
+  color: #333;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.review-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px;
+}
+
+.review-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px;
+  border-bottom: 1px solid #eee;
+  font-size: 12px;
+}
+
+.review-item:last-child {
+  border-bottom: none;
+}
+
+.step-num {
+  font-weight: bold;
+  color: #321fdb;
+  min-width: 20px;
+}
+
+.step-desc {
+  flex: 1;
+  word-break: break-word;
+  color: #333;
+}
+
+.step-del-btn {
+  background: none;
+  border: none;
+  color: #e55353;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 5px;
+}
+
+.step-del-btn:hover {
+  background: rgba(229, 83, 83, 0.1);
+  border-radius: 4px;
+}
+
+.review-footer {
+  padding: 10px;
+  border-top: 1px solid #ddd;
+  display: flex;
+  gap: 10px;
+  background: #fff;
+}
+
+.btn-confirm {
+  flex: 1;
+  padding: 8px;
+  background: #2eb85c; /* Green */
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.btn-cancel {
+  flex: 1;
+  padding: 8px;
+  background: #ced2d8;
+  color: #333;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.btn-confirm:hover { background: #25964b; }
+.btn-cancel:hover { background: #b6bec7; }

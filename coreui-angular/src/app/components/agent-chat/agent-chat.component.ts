@@ -25,7 +25,7 @@ export class AgentChatComponent implements OnInit, OnDestroy {
   inputText = '';
   
   messages: ChatMessage[] = [
-    { id: 'init', type: 'agent', text: '👋 I am your AI Assistant.\n\n• Chat Mode: Ask about page features\n• Task Mode: Execute instructions' }
+    { id: 'init', type: 'agent', text: '👋 AI Assistant Ready.\n\n• Chat Mode: Ask about page\n• Task Mode: Execute instructions' }
   ];
 
   // State flags
@@ -34,17 +34,17 @@ export class AgentChatComponent implements OnInit, OnDestroy {
   autoRunning = false;
   isMinimized = false;
   
-  // Connection status text for Header (Simple status only)
+  // Review Mode State
+  isReviewing = false;
+  reviewSteps: any[] = [];
+  reviewTaskName = '';
+
+  // UI Status
   connectionStatus = 'Connecting...';
-  
-  // Mode control
   currentMode: 'chat' | 'task' = 'chat';
-  
-  // Task context
   currentTask = '';
   stepCount = 0;
 
-  // Reconnection management
   private reconnectTimer: any; 
   private isComponentAlive = true;
 
@@ -53,17 +53,12 @@ export class AgentChatComponent implements OnInit, OnDestroy {
     private recordingService: RecordingService
   ) {}
 
-  ngOnInit() {
-    this.connectWebSocket();
-  }
+  ngOnInit() { this.connectWebSocket(); }
 
-  // --- WebSocket Connection (Auto-Reconnect) ---
+  // --- WebSocket Connection ---
   connectWebSocket() {
-    if (this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) {
-        return;
-    }
+    if (this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) return;
 
-    // Initial status
     this.connectionStatus = 'Connecting...';
     
     try {
@@ -73,9 +68,7 @@ export class AgentChatComponent implements OnInit, OnDestroy {
           this.isConnected = true;
           if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
           
-          // ✅ Success Status
           this.connectionStatus = '🟢 Connected';
-          console.log('[Agent] WebSocket Connected');
           
           if (this.socket) this.recordingService.setSocket(this.socket);
         };
@@ -87,10 +80,7 @@ export class AgentChatComponent implements OnInit, OnDestroy {
           this.autoRunning = false; 
           
           if (this.isComponentAlive) {
-              // 🔥 UI Change: Only show "Disconnected"
               this.connectionStatus = '🔴 Disconnected';
-              
-              // 🔥 Console Change: Log retry details here instead
               console.warn('[Agent] Connection lost. Retrying in 3s...');
               
               if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
@@ -113,28 +103,37 @@ export class AgentChatComponent implements OnInit, OnDestroy {
     }
   }
 
-  // --- Message Handling Core ---
+  // --- Message Handling ---
   handleIncomingMessage(jsonStr: string) {
     try {
       const cmd = JSON.parse(jsonStr);
       const msgId = Date.now().toString();
 
-      if (cmd.action === 'message') {
-        this.messages.push({ id: msgId, type: 'agent', text: cmd.value });
+      // 1. Handle Preview Data (Review Mode)
+      if (cmd.action === 'preview_data') {
+          this.reviewSteps = cmd.data;
+          this.isReviewing = true;
+          return;
+      }
+
+      // 2. Handle Text Messages & Completion Signals
+      // 🔥 FIX: Accept 'return', 'finish', 'done' as valid completion signals from LLM
+      if (['message', 'return', 'finish', 'done'].includes(cmd.action)) {
+        const text = cmd.value || 'Task Completed';
+        this.messages.push({ id: msgId, type: 'agent', text: text });
         
         if (this.autoRunning) {
           this.stopAutoRun('Task Completed by AI');
         }
       } 
+      // 3. Handle Actions
       else if (['click', 'type', 'select'].includes(cmd.action)) {
         const result = this.agentService.executeCommand(cmd.action, cmd.id, cmd.value);
-
-        const actionText = cmd.action === 'click' ? 'Click' : (cmd.action === 'type' ? 'Type' : 'Select');
         
         this.messages.push({
           id: msgId,
           type: 'agent',
-          text: `Step ${this.stepCount}: ${actionText} -> [${cmd.id}]`,
+          text: `Step ${this.stepCount}: ${result}`,
           actionData: cmd, 
           feedback: null
         });
@@ -144,6 +143,7 @@ export class AgentChatComponent implements OnInit, OnDestroy {
           this.sendFeedback(msgId, 'bad', cmd); 
           this.stopAutoRun('Execution Error');
         } else {
+          // Auto-Loop
           if (this.autoRunning) {
             this.triggerNextStep();
           }
@@ -155,11 +155,11 @@ export class AgentChatComponent implements OnInit, OnDestroy {
     }
   }
 
-  // --- Auto-Loop Logic ---
+  // --- Auto-Loop ---
   triggerNextStep() {
     this.stepCount++;
     if (this.stepCount > 20) {
-      this.stopAutoRun('Max step limit reached (20)');
+      this.stopAutoRun('Max step limit reached');
       return;
     }
     setTimeout(() => {
@@ -175,19 +175,20 @@ export class AgentChatComponent implements OnInit, OnDestroy {
     this.messages.push({ id: Date.now().toString(), type: 'user', text: cmd });
     this.inputText = '';
 
+    // Local Debug Scan
     if (cmd.toLowerCase() === 'scan' && this.currentMode === 'task') {
       const domSnapshot = this.agentService.scanPage();
       console.log(domSnapshot);
       this.messages.push({
         id: Date.now().toString() + '_scan',
         type: 'system',
-        text: `📄 Scan Complete (${domSnapshot.split('\n').length} elements)\n(Check console for details)`
+        text: `📄 Scan Complete (${domSnapshot.split('\n').length} elements)\n(Check console)`
       });
       return;
     }
 
     if (!this.isConnected) {
-      this.messages.push({ id: 'err', type: 'system', text: 'Not Connected (Check Console)' });
+      this.messages.push({ id: 'err', type: 'system', text: 'Not Connected' });
       return;
     }
 
@@ -207,7 +208,6 @@ export class AgentChatComponent implements OnInit, OnDestroy {
         this.stopAutoRun("Connection lost");
         return;
     }
-
     const dom = this.agentService.scanPage();
     this.socket.send(JSON.stringify({
       instruction: task,
@@ -218,13 +218,61 @@ export class AgentChatComponent implements OnInit, OnDestroy {
     this.scrollToBottom();
   }
 
-  // --- Helper Functions ---
+  // --- Recording & Review ---
+  toggleRecording() {
+    if (this.autoRunning) this.stopAutoRun('Switching to record');
+
+    this.isRecording = !this.isRecording;
+    if (this.isRecording) {
+      this.agentService.scanPage(); 
+      this.recordingService.startRecording();
+      this.messages.push({ id: 'rec_start', type: 'system', text: '🔴 Recording started...' });
+    } else {
+      this.recordingService.stopRecording();
+      const taskName = window.prompt("Recording stopped! Please name this task:");
+      
+      if (taskName) {
+        this.reviewTaskName = taskName;
+        if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+             this.socket.send(JSON.stringify({ type: 'request_preview' }));
+        }
+      } else {
+        this.messages.push({ id: 'rec_cancel', type: 'system', text: '⚠️ Unnamed, discarded' });
+      }
+    }
+  }
+
+  // Review Actions
+  removeStep(index: number) {
+      this.reviewSteps.splice(index, 1);
+  }
+
+  confirmSave() {
+      if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+        this.socket.send(JSON.stringify({ 
+            type: 'save_demo', 
+            name: this.reviewTaskName,
+            steps: this.reviewSteps 
+        }));
+        this.messages.push({ id: 'rec_end', type: 'system', text: `💾 Demo "${this.reviewTaskName}" Saved.` });
+      }
+      this.isReviewing = false;
+      this.reviewSteps = [];
+  }
+
+  cancelSave() {
+      this.isReviewing = false;
+      this.reviewSteps = [];
+      this.messages.push({ id: 'rec_cancel', type: 'system', text: '⚠️ Save cancelled.' });
+  }
+
+  // --- Helpers ---
   setMode(mode: 'chat' | 'task') {
     this.currentMode = mode;
     this.messages.push({
       id: Date.now().toString(),
       type: 'system',
-      text: mode === 'chat' ? '💬 Switched to Chat Mode' : '⚡ Switched to Task Mode'
+      text: mode === 'chat' ? '💬 Chat Mode' : '⚡ Task Mode'
     });
   }
 
@@ -236,27 +284,7 @@ export class AgentChatComponent implements OnInit, OnDestroy {
   stopAutoRun(reason: string = '') {
     if (this.autoRunning) {
       this.autoRunning = false;
-      this.messages.push({ id: 'sys_stop', type: 'system', text: `⏹️ Auto-run stopped: ${reason}` });
-    }
-  }
-
-  toggleRecording() {
-    if (this.autoRunning) this.stopAutoRun('Switching to record');
-
-    this.isRecording = !this.isRecording;
-    if (this.isRecording) {
-      this.agentService.scanPage(); 
-      this.recordingService.startRecording();
-      this.messages.push({ id: 'rec_start', type: 'system', text: '🔴 Recording started... Please operate the page' });
-    } else {
-      this.recordingService.stopRecording();
-      const taskName = window.prompt("Recording stopped! Please name this task:");
-      if (taskName && this.socket && this.socket.readyState === WebSocket.OPEN) {
-        this.socket.send(JSON.stringify({ type: 'save_demo', name: taskName }));
-        this.messages.push({ id: 'rec_end', type: 'system', text: `💾 Saving demo: "${taskName}"` });
-      } else {
-        this.messages.push({ id: 'rec_cancel', type: 'system', text: '⚠️ Discarded' });
-      }
+      this.messages.push({ id: 'sys_stop', type: 'system', text: `⏹️ Stopped: ${reason}` });
     }
   }
 

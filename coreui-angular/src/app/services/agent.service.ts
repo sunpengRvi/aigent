@@ -1,5 +1,4 @@
 import { Injectable } from '@angular/core';
-// 👇 Import standard accessibility computation library (Core Upgrade)
 import { computeAccessibleName } from 'dom-accessibility-api';
 
 @Injectable({
@@ -11,76 +10,61 @@ export class AgentService {
   constructor() {}
 
   /**
-   * 👁️ [Eyes] v6: Standard Accessibility Scan + Deep Context
-   * Scans the page for interactive elements, assigns unique IDs, and generates descriptive labels using standard accessibility rules.
+   * 👁️ [Eyes] Scan Page
    */
   scanPage(): string {
     const report: string[] = [];
     this.uniqueIdCounter = 1;
 
-    // Scan all elements, relying on the standard library and logic to filter
     const elements = document.querySelectorAll('*'); 
 
     elements.forEach((node) => {
       const el = node as HTMLElement;
       
-      // 1. Basic Filtering: Invisible, Agent itself
+      // 1. Basic Filtering
       if (!this.isVisible(el)) return;
       if (el.closest('.agent-chat-container')) return;
       
       // 2. Interactivity Check
-      // We only care about elements the user can interact with
       const tagName = el.tagName.toLowerCase();
       const interactiveTags = ['a', 'button', 'input', 'select', 'textarea', 'summary', 'details'];
       const interactiveRoles = ['button', 'link', 'checkbox', 'radio', 'textbox', 'listbox', 'combobox', 'menuitem', 'tab'];
       const role = el.getAttribute('role');
 
       const isInteractive = interactiveTags.includes(tagName) || (role && interactiveRoles.includes(role));
-
-      // Skip non-interactive elements (unless they have explicit onclick, which is hard to detect reliably)
       if (!isInteractive) return;
 
-      // 3. Tagging: Assign unique Agent ID
+      // 3. Tagging
       const agentId = this.uniqueIdCounter++;
       el.setAttribute('data-agent-id', agentId.toString());
 
+      // 4. Feature Extraction
       const type = el.getAttribute('type') || '';
-
-      // 🔥 4. Compute "Accessible Name" using standard library
-      // This automatically handles <label for>, aria-label, aria-labelledby, placeholder, title, alt, etc.
-      // This is much more robust than custom logic.
-      let accName = computeAccessibleName(el);
+      const href = el.getAttribute('href') || '';
+      const name = el.getAttribute('name') || '';
+      const placeholder = el.getAttribute('placeholder') || '';
+      const testId = el.getAttribute('data-testid') || el.id || '';
       
-      // Fallback strategy: If the standard library returns empty (e.g., icon-only button without aria), try innerText
-      if (!accName && el.innerText) {
-          accName = this.cleanText(el.innerText);
+      let attrParts = [];
+      if (type) attrParts.push(`type="${type}"`);
+      if (href && href !== '#' && !href.startsWith('javascript')) {
+          attrParts.push(`href="${href}"`);
+      }
+      if (name) attrParts.push(`name="${name}"`);
+      if (testId) attrParts.push(`id="${testId}"`);
+      if (placeholder) attrParts.push(`placeholder="${placeholder}"`);
+      
+      const attrsStr = attrParts.length > 0 ? ' ' + attrParts.join(' ') : '';
+
+      // 5. Semantic Description + Structure
+      let finalDesc = this.getElementDescription(el);
+
+      // 6. 🔥 Active State Detection (Critical for navigation logic)
+      if (el.classList.contains('active') || el.getAttribute('aria-current') === 'page') {
+          finalDesc += ' [Active]';
       }
 
-      // 5. Get Hierarchy Context (Retain v5 logic for Admin Templates)
-      const context = this.getHierarchyPath(el);
-      
-      // 6. Combine Description
-      // Format: [Grandparent > Parent] Element Name
-      let finalDesc = accName;
-      if (context) {
-         // Prevent duplication if context is already part of the name (e.g. Card Title is also Button Text)
-         if (!accName.includes(context)) {
-             finalDesc = `[${context}] ${accName}`;
-         } else {
-             finalDesc = `[${context}]`; 
-         }
-      }
-      
-      // If absolutely no description found, mark as Unnamed (AI likely cannot operate this)
-      if (!finalDesc || finalDesc.trim() === '') {
-          // Last resort: check ID or Class for hints
-          finalDesc = el.id ? `#${el.id}` : 'Unnamed Element';
-      }
-
-      // Truncate long descriptions
-      if (finalDesc.length > 120) finalDesc = finalDesc.substring(0, 120) + '...';
-
-      // 7. State Info (Value / Checked)
+      // 7. Input State Info
       let stateInfo = '';
       if (tagName === 'input') {
         if (type === 'checkbox' || type === 'radio') {
@@ -94,55 +78,84 @@ export class AgentService {
         stateInfo = `[Selected: "${selectedOption ? selectedOption.text.trim() : select.value}"]`;
       }
 
-      report.push(`[${agentId}] <${tagName}${type ? ' type="' + type + '"' : ''}> "${finalDesc}" ${stateInfo}`);
+      report.push(`[${agentId}] <${tagName}${attrsStr}> "${finalDesc}" ${stateInfo}`);
     });
 
     return report.join('\n');
   }
 
-  // 🧠 Get Hierarchy Path (Card > Group) - Reused from v5 logic
-  // Climbs up the DOM to find semantic container titles (Cards, Modals, Fieldsets)
+  /**
+   * Get Semantic Description + Spatial Context
+   */
+  public getElementDescription(el: HTMLElement): string {
+      let accName = computeAccessibleName(el);
+      if (!accName && el.innerText) {
+          accName = this.cleanText(el.innerText);
+      }
+      
+      const hierarchy = this.getHierarchyPath(el);
+      const structure = this.getStructuralContext(el);
+
+      let desc = accName;
+      
+      if (hierarchy) {
+         if (!accName.includes(hierarchy)) {
+             desc = `${hierarchy} > ${accName}`;
+         }
+      }
+      
+      if (structure) {
+          desc = `[${structure}] ${desc}`;
+      }
+      
+      if (!desc || desc.trim() === '') desc = "Unnamed Element";
+      if (desc.length > 150) desc = desc.substring(0, 150) + '...';
+      
+      return desc;
+  }
+
+  private getStructuralContext(el: HTMLElement): string {
+      let parent = el.parentElement;
+      let depth = 0;
+      
+      while (parent && depth < 10) {
+          const cls = parent.classList;
+          const id = parent.id || '';
+          
+          if (cls.contains('sidebar') || cls.contains('c-sidebar') || id.includes('sidebar')) return 'Sidebar';
+          if (cls.contains('breadcrumb') || cls.contains('c-breadcrumb')) return 'Breadcrumb';
+          if (cls.contains('header') || cls.contains('c-header') || cls.contains('navbar')) return 'Header';
+          if (cls.contains('footer') || cls.contains('c-footer')) return 'Footer';
+          
+          parent = parent.parentElement;
+          depth++;
+      }
+      return '';
+  }
+
   private getHierarchyPath(el: HTMLElement): string {
     const paths: string[] = [];
     let parent = el.parentElement;
     let depth = 0;
 
-    // Look up to 8 levels deep
-    while (parent && depth < 8) {
+    while (parent && depth < 5) {
       const classList = parent.classList;
       const tagName = parent.tagName;
       let foundTitle = '';
 
-      // A. Card / Widget
       if (classList.contains('card') || classList.contains('c-card') || classList.contains('card-body')) {
-        // Try to find header at the same level or parent level depending on structure
         const card = classList.contains('card-body') ? parent.parentElement : parent;
         const header = card?.querySelector('.card-header, .c-card-header');
         if (header) foundTitle = this.cleanText(header.textContent || '');
       }
-      // B. Form Group / Row
-      else if (classList.contains('row') || classList.contains('mb-3') || classList.contains('form-group')) {
-        const groupLabel = parent.querySelector('label, legend, h6, h5');
+      else if (classList.contains('form-group') || classList.contains('mb-3')) {
+        const groupLabel = parent.querySelector('label, h6');
         if (groupLabel) {
             const forAttr = groupLabel.getAttribute('for');
-            // Avoid using the element's own direct label as a context header
-            if (!forAttr || forAttr !== el.id) {
-                foundTitle = this.cleanText(groupLabel.textContent || '');
-            }
+            if (!forAttr || forAttr !== el.id) foundTitle = this.cleanText(groupLabel.textContent || '');
         }
       }
-      // C. Fieldset
-      else if (tagName === 'FIELDSET') {
-        const legend = parent.querySelector('legend');
-        if (legend) foundTitle = this.cleanText(legend.textContent || '');
-      }
-      // D. Modal
-      else if (classList.contains('modal-content')) {
-        const title = parent.querySelector('.modal-title');
-        if (title) foundTitle = this.cleanText(title.textContent || '');
-      }
-
-      // Add found title to path if unique and short enough
+      
       if (foundTitle && foundTitle.length > 0 && foundTitle.length < 40 && !paths.includes(foundTitle)) {
         paths.unshift(foundTitle);
       }
@@ -152,35 +165,32 @@ export class AgentService {
     return paths.join(' > ');
   }
 
-  // ✋ Execute Command (DOM Manipulation)
   executeCommand(action: string, id: string, value: string = ''): string {
     const el = document.querySelector(`[data-agent-id="${id}"]`) as HTMLElement;
-    
-    if (!el) return `❌ ID [${id}] not found (Try scanning again)`;
+    if (!el) return `❌ ID [${id}] not found`;
 
     this.highlightElement(el);
+    const elementDesc = this.getElementDescription(el); 
+    const shortDesc = elementDesc.length > 50 ? elementDesc.substring(0, 50) + '...' : elementDesc;
 
     try {
       switch (action) {
         case 'click':
           el.click();
-          return `✅ Clicked [${id}]`;
+          return `✅ Clicked "${shortDesc}"`;
 
         case 'type':
           if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
             el.value = value;
-            // Dispatch events to notify Angular/Framework of changes
             el.dispatchEvent(new Event('input', { bubbles: true }));
             el.dispatchEvent(new Event('change', { bubbles: true }));
-            return `✅ Typed "${value}"`;
+            return `✅ Typed "${value}" into "${shortDesc}"`;
           }
-          return `❌ Element [${id}] is not an input`;
+          return `❌ Element "${shortDesc}" is not an input`;
 
         case 'select':
           if (el instanceof HTMLSelectElement) {
-            // Try matching by value first
             el.value = value;
-            // If value match fails, try fuzzy text match
             if (el.value !== value) {
                 let found = false;
                 Array.from(el.options).forEach((opt, idx) => {
@@ -189,12 +199,12 @@ export class AgentService {
                         found = true;
                     }
                 });
-                if (!found) return `❌ Option "${value}" not found in select`;
+                if (!found) return `❌ Option "${value}" not found in "${shortDesc}"`;
             }
             el.dispatchEvent(new Event('change', { bubbles: true }));
-            return `✅ Selected "${value}"`;
+            return `✅ Selected "${value}" in "${shortDesc}"`;
           }
-          return `❌ Element [${id}] is not a dropdown`;
+          return `❌ Element "${shortDesc}" is not a dropdown`;
 
         default:
           return `❌ Unknown action: ${action}`;
@@ -204,45 +214,23 @@ export class AgentService {
     }
   }
 
-  // Helper: Check visibility
   private isVisible(el: HTMLElement): boolean {
       return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
   }
 
-  // Helper: Clean text
   private cleanText(str: string): string {
     return str.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
   }
 
-  // Helper: Visual feedback (Highlight)
   private highlightElement(el: HTMLElement) {
     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
     const originalOutline = el.style.outline;
     const originalTransition = el.style.transition;
-    
     el.style.transition = 'all 0.3s';
-    el.style.outline = '3px solid #e55353'; // CoreUI Red
-    el.style.boxShadow = '0 0 10px rgba(229, 83, 83, 0.5)';
-
+    el.style.outline = '3px solid #e55353'; 
     setTimeout(() => {
       el.style.outline = originalOutline;
-      el.style.boxShadow = 'none';
       el.style.transition = originalTransition;
     }, 1000);
-  }
-  
-  // 🔥 Public Method: Get Semantic Description (Used by RecordingService)
-  // Ensures consistency between recording logs and execution scans
-  public getElementDescription(el: HTMLElement): string {
-      let accName = computeAccessibleName(el);
-      if (!accName && el.innerText) accName = this.cleanText(el.innerText);
-      
-      const context = this.getHierarchyPath(el);
-      let desc = accName;
-      
-      if (context && !accName.includes(context)) {
-          desc = `[${context}] ${accName}`;
-      }
-      return desc || 'Unknown Element';
   }
 }

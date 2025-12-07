@@ -52,3 +52,7 @@ Thumbs.db
 
 #chromadb
 *.sqlite3
+backend/agent_brain_db
+
+#trajectories
+*.jsonl

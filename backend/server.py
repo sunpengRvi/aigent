@@ -1,26 +1,24 @@
 import os
-import re
+import sys
 # ==========================================
 # 🛑 1. Environment Configuration
 # ==========================================
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-import os
-import sys
 import re
 import json
 import datetime
+import hashlib
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from openai import AsyncOpenAI
 import chromadb
 
-
 # ==========================================
 # 2. Configuration & Initialization
 # ==========================================
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434/v1")
-MODEL_NAME = os.environ.get("MODEL_NAME", "deepseek-r1:14b") # Your model
+MODEL_NAME = os.environ.get("MODEL_NAME", "deepseek-r1:14b") 
 API_KEY = os.environ.get("DEEPSEEK_API_KEY", "ollama")
 
 print(f"🔌 Connecting to AI Engine: {OLLAMA_HOST}")
@@ -28,99 +26,213 @@ print(f"🧠 Using Model: {MODEL_NAME}")
 
 client = AsyncOpenAI(api_key=API_KEY, base_url=OLLAMA_HOST)
 
-# Vector Database
+# Database
 chroma_client = chromadb.PersistentClient(path="./agent_brain_db")
 demo_collection = chroma_client.get_or_create_collection(name="demonstrations")
 rl_collection = chroma_client.get_or_create_collection(name="rl_feedback")
 
-# Log File
 DATASET_FILE = "user_trajectories.jsonl"
-
 app = FastAPI()
 
 # --- Runtime Cache ---
 current_recording_session = [] 
 last_context_cache = {}        
 session_step_history = {}      
-chat_history_cache = {}        
+chat_history_cache = {}
+session_blacklists = {} 
 
 # ==========================================
 # 3. Helper Functions
 # ==========================================
 def clean_ai_response(content):
+    """Robustly extract JSON."""
     try:
-        if "<think>" in content:
-            content = content.split("</think>")[-1]
-        content = content.replace("```json", "").replace("```", "").strip()
-        data = json.loads(content)
+        print(f"\n🧠 [AI Reasoning]:\n{content}\n")
+        json_match = re.search(r'```json\s*(\{.*?\})\s*```', content, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(1)
+        else:
+            json_match = re.search(r'(\{.*\})', content, re.DOTALL)
+            if json_match: json_str = json_match.group(1)
+            else: return json.dumps({"action": "message", "value": f"AI Raw: {content[:100]}..."})
+
+        data = json.loads(json_str)
+        
+        # Normalize keys
+        if 'action' in data and data['action'] in ['finish', 'return', 'done']:
+            return json.dumps({"action": "message", "value": "Task Completed"})
+
         if 'id' in data:
             match = re.search(r'(\d+)', str(data['id']))
             if match: data['id'] = match.group(1)
+            else: data['id'] = "INVALID_ID"
+
+        if 'value' not in data:
+            if 'message' in data: data['value'] = data['message']
+            elif 'text' in data: data['value'] = data['text']
+
         return json.dumps(data)
-    except:
-        return content
+    except Exception as e:
+        print(f"❌ Parse Error: {e}")
+        return json.dumps({"action": "error", "value": "Parse Error"})
 
 def save_raw_log(data):
     try:
-        if 'server_time' not in data:
-            data['server_time'] = datetime.datetime.now().isoformat()
-        with open(DATASET_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(data, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"❌ Log Write Failed: {e}")
+        if 'server_time' not in data: data['server_time'] = datetime.datetime.now().isoformat()
+        with open(DATASET_FILE, "a", encoding="utf-8") as f: f.write(json.dumps(data, ensure_ascii=False) + "\n")
+    except: pass
+
+def get_context_fingerprint(dom_str):
+    if not dom_str: return "empty"
+    tokens = re.findall(r'\[\d+\]\s*<(\w+)', dom_str)
+    skeleton = "|".join(tokens[:300]) 
+    return hashlib.md5(skeleton.encode('utf-8')).hexdigest()
+
+# Helper: Check if text exists in DOM
+def find_element_in_dom(desc, dom_str):
+    clean_desc = desc.replace("[Sidebar]", "").replace("[Header]", "").strip()
+    if clean_desc in dom_str: return True
+    return False
+
+# 🔥 Helper: Check if the element matching the description is ACTIVE
+def is_target_active(desc, dom_str):
+    """
+    Checks if the DOM line containing 'desc' also contains '[Active]'.
+    """
+    clean_desc = desc.replace("[Sidebar]", "").replace("[Header]", "").strip()
+    # Find line containing the description
+    # Regex: [ID] ... desc ...
+    # We escape clean_desc to handle special chars
+    try:
+        # Simple string check first for speed
+        if clean_desc not in dom_str: return False
+        
+        # Look for the specific line
+        lines = dom_str.split('\n')
+        for line in lines:
+            if clean_desc in line:
+                if "[Active]" in line or 'class="active"' in line:
+                    return True
+    except: pass
+    return False
 
 # ==========================================
-# 4. Brain A: Task Execution (Task Mode)
+# 4. Core Brain A: Task Execution
 # ==========================================
-async def ask_brain_task(user_goal, dom_state, session_id, history_logs):
+async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant_bans_map):
     print(f"⚡ [Task Brain] Goal: {user_goal}")
     
-    # --- RAG Retrieval (Demo & RL) ---
+    current_hash = get_context_fingerprint(dom_state)
+    context_specific_bans = instant_bans_map.get(current_hash, set())
+    if context_specific_bans:
+        print(f"🚫 Bans Active: {list(context_specific_bans)}")
+
+    # 1. Loop Detection
+    if len(history_logs) >= 4:
+        last_three = history_logs[-3:]
+        if last_three[0] == last_three[1] == last_three[2]:
+            return json.dumps({"action": "message", "value": "Task Completed (Loop Detected)"})
+
+    # 2. RAG Retrieval & Smart Logic
     demo_prompt = ""
+    current_step_target = None
+    should_stop = False
+    
     try:
         demo_results = demo_collection.query(query_texts=[user_goal], n_results=1)
         if demo_results['documents'] and len(demo_results['documents'][0]) > 0:
             steps = json.loads(demo_results['metadatas'][0][0]['steps'])
-            demo_prompt = "### REFERENCE DEMONSTRATION:\n"
-            for i, step in enumerate(steps):
-                act = step.get('action', {})
-                desc = step.get('element_desc', 'unknown')
-                demo_prompt += f"Step {i+1}: {act.get('type')} on {desc}\n"
-            demo_prompt += "### END DEMONSTRATION\n"
-    except: pass
+            total_steps = len(steps)
+            
+            # A. Smart Step Selection (Reverse Goal Seek)
+            target_step_idx = -1
+            
+            # Check backwards: Is the Final Step visible?
+            for idx in range(total_steps - 1, -1, -1):
+                step = steps[idx]
+                desc = step.get('element_desc', '')
+                if find_element_in_dom(desc, dom_state):
+                    target_step_idx = idx
+                    break 
+            
+            if target_step_idx == -1:
+                target_step_idx = len(history_logs)
 
+            # 🔥🔥 B. ZERO-CLICK COMPLETION CHECK
+            # If we are targeting the Final Step (or beyond), check if it is ALREADY ACTIVE.
+            if target_step_idx == total_steps - 1:
+                target_step = steps[target_step_idx]
+                desc = target_step.get('element_desc', '')
+                
+                if is_target_active(desc, dom_state):
+                    print(f"🎉 Goal '{desc}' is already [Active]. Task Completed!")
+                    return json.dumps({"action": "message", "value": "Task Completed (Goal Already Active)"})
+
+            # C. Smart Stop (History Check)
+            if history_logs and steps:
+                if len(history_logs) >= total_steps + 1:
+                    should_stop = True
+            
+            if target_step_idx < total_steps:
+                target_step = steps[target_step_idx]
+                action_type = target_step.get('action', {}).get('type')
+                desc = target_step.get('element_desc', 'unknown')
+                current_step_target = f"{action_type} on \"{desc}\""
+                
+                demo_prompt = f"### 🟢 SMART OBJECTIVE:\n"
+                demo_prompt += f"Based on UI state, jump to Step {target_step_idx + 1} of {total_steps}.\n"
+                demo_prompt += f"TARGET: {current_step_target}\n"
+            else:
+                should_stop = True
+                demo_prompt = "### 🟢 STATUS:\nSteps appear complete.\n"
+
+    except Exception as e:
+        print(f"⚠️ RAG Demo Error: {e}")
+
+    # 3. RAG Feedback
     rl_prompt = ""
     try:
         rl_query = f"Goal: {user_goal}\nContext: {dom_state[:500]}"
-        rl_results = rl_collection.query(query_texts=[rl_query], n_results=3)
+        rl_results = rl_collection.query(query_texts=[rl_query], n_results=5)
         if rl_results['documents'] and len(rl_results['documents'][0]) > 0:
-            rl_prompt = "### LEARNED FEEDBACK:\n"
-            for meta in rl_results['metadatas'][0]:
-                if meta['reward'] > 0: rl_prompt += f"- GOOD: Doing '{meta['action']}' worked.\n"
-                else: rl_prompt += f"- BAD: Avoid '{meta['action']}'.\n"
-            rl_prompt += "### END FEEDBACK\n"
+            rl_prompt = "### 🔴 MISTAKES HISTORY:\n"
+            for i, meta in enumerate(rl_results['metadatas'][0]):
+                if meta['reward'] < 0:
+                    rl_prompt += f"❌ FAILED previously: {meta['action']}\n"
+            rl_prompt += "### END MISTAKES\n"
     except: pass
 
-    history_prompt = ""
-    if history_logs:
-        history_prompt = "### SESSION HISTORY:\n" + "\n".join(history_logs[-8:]) + "\n"
+    # 4. System Prompt
+    instruction = ""
+    if should_stop:
+        instruction = "Task completed. Return 'Task Completed' immediately."
+    elif current_step_target:
+        instruction = f"Find element matching: [{current_step_target}]. Do NOT return 'Task Completed' yet."
+    else:
+        instruction = "Follow demo steps."
 
-    # --- Task System Prompt ---
     system_prompt = f"""
-    You are an intelligent web automation agent.
+    You are a precise web automation agent.
     
     {demo_prompt}
     {rl_prompt}
-    {history_prompt}
     
-    Task: Generate the NEXT single JSON action.
+    TASK: {instruction}
     
-    RULES:
-    1. **ID MATCHING**: Use the exact numeric ID from 'CURRENT VISIBLE UI'.
-    2. **NO TEXT ID**: Never use text as ID.
-    3. **CHECK HISTORY**: Don't repeat failed actions.
-    4. **FINISH**: If task completed, return {{"action": "message", "value": "Task Completed"}}.
-    5. Output JSON ONLY. Format: {{"action": "click|type|select", "id": "...", "value": "..."}}
+    🛑 RULES:
+    1. **BANNED IDs**: {list(context_specific_bans)}. DO NOT CLICK.
+    2. **SEMANTIC MATCH**: Use description to find the INTEGER ID.
+    3. **SMART SKIPPING**: If target is visible, click it.
+    4. **FINISH**: If {should_stop} is True, STOP and return "Task Completed".
+    
+    RESPONSE FORMAT:
+    Step 1: Identify target.
+    Step 2: Find matching ID.
+    Step 3: Output JSON.
+    
+    ```json
+    {{"action": "click", "id": "10", "value": "..."}}
+    ```
     """
     
     user_prompt = f"GOAL: {user_goal}\nCURRENT VISIBLE UI:\n{dom_state}"
@@ -132,71 +244,54 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.1
+            temperature=0.0
         )
-        return clean_ai_response(response.choices[0].message.content.strip())
+        result_str = clean_ai_response(response.choices[0].message.content.strip())
+        
+        # Validation Logic
+        try:
+            res_json = json.loads(result_str)
+            
+            if res_json.get('action') == 'message':
+                return result_str
+
+            target_id = str(res_json.get('id'))
+            
+            if not target_id.isdigit():
+                 return json.dumps({"action": "message", "value": "Error: AI generated invalid ID format."})
+
+            if target_id in context_specific_bans:
+                return json.dumps({"action": "message", "value": f"Blocked banned ID {target_id}."})
+            
+            # Repetitive Click Guard
+            if history_logs:
+                last_log = history_logs[-1]
+                if str(target_id) in last_log and res_json.get('action') == 'click':
+                    print(f"🛡️ Repetitive Click. Assuming Task Done.")
+                    return json.dumps({"action": "message", "value": "Task Completed"})
+
+        except: pass
+
+        return result_str
+
     except Exception as e:
         return json.dumps({"action": "error", "value": f"Task AI Error: {str(e)}"})
 
 # ==========================================
-# 5. Brain B: Chat (Chat Mode - Enhanced)
+# 5. Chat Brain
 # ==========================================
 async def ask_brain_chat(user_msg, dom_state, session_id):
     print(f"💬 [Chat Brain] User: {user_msg}")
-    
-    # 🔥 核心修改：更新 Chat Mode 的系统提示词
-    # 明确告诉 AI 它有两种模式：页面助手 和 通用助手
-    chat_system_prompt = """
-    You are a versatile AI assistant embedded in a web application.
-    
-    Your Capabilities:
-    1. **General Knowledge**: You can answer questions about coding, history, science, writing, etc., just like ChatGPT.
-    2. **Page Awareness**: You have read-only access to the current webpage structure (Context).
-    
-    Instructions:
-    - If the user asks about the current page (e.g., "What is this page?", "Where is the login button?"), analyze the Context.
-    - If the user asks a GENERAL question (e.g., "Write a python script", "Explain Quantum Physics"), IGNORE the Context and answer using your general knowledge.
-    - Do NOT output JSON actions in this mode. Just chat naturally.
-    """
-
     if session_id not in chat_history_cache:
-        chat_history_cache[session_id] = [
-            {"role": "system", "content": chat_system_prompt}
-        ]
-    
+        chat_history_cache[session_id] = [{"role": "system", "content": "You are a versatile AI assistant."}]
     history = chat_history_cache[session_id]
-    
-    # 🔥 优化：将页面上下文作为"辅助信息"而非"强制约束"
-    # 我们明确标注 Context 部分
-    current_input = f"""
-    [Current Page Context (Use only if relevant)]:
-    {dom_state[:1500]}... (truncated)
-    
-    [User Question]:
-    {user_msg}
-    """
-    
-    history.append({"role": "user", "content": current_input})
-    
+    history.append({"role": "user", "content": f"[Context]:\n{dom_state[:1000]}\n[Q]: {user_msg}"})
     try:
-        response = await client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=history,
-            temperature=0.7, # 提高创造力
-            stream=False
-        )
-        
-        reply = response.choices[0].message.content
+        res = await client.chat.completions.create(model=MODEL_NAME, messages=history, temperature=0.7)
+        reply = res.choices[0].message.content
         if "<think>" in reply: reply = reply.split("</think>")[-1].strip()
-            
         history.append({"role": "assistant", "content": reply})
-        
-        # 这里的截断逻辑要小心，保留 System Prompt
-        if len(history) > 12: 
-            chat_history_cache[session_id] = [history[0]] + history[-11:]
-            
         return json.dumps({"action": "message", "value": reply})
-        
     except Exception as e:
         return json.dumps({"action": "message", "value": f"Chat Error: {str(e)}"})
 
@@ -210,6 +305,7 @@ async def websocket_endpoint(websocket: WebSocket):
     global current_recording_session
     
     if session_id not in session_step_history: session_step_history[session_id] = []
+    if session_id not in session_blacklists: session_blacklists[session_id] = {} 
     
     print(f"✅ Frontend Connected (Session: {session_id})")
     
@@ -220,95 +316,113 @@ async def websocket_endpoint(websocket: WebSocket):
                 payload = json.loads(raw_data)
                 msg_type = payload.get('type')
 
-                # --- A. Record ---
+                # A. Record
                 if msg_type == 'record_event':
                     current_recording_session.append(payload)
                     save_raw_log(payload)
                     print(f"📹 [Rec] {payload.get('action',{}).get('type')}")
                     continue
 
-                # --- B. Save Demo ---
+                # B. Preview
+                if msg_type == 'request_preview':
+                    await websocket.send_text(json.dumps({"action": "preview_data", "data": current_recording_session}))
+                    continue
+
+                # C. Save Demo
                 if msg_type == 'save_demo':
                     task_name = payload.get('name')
-                    if current_recording_session:
+                    final_steps = payload.get('steps') or current_recording_session
+                    if final_steps:
                         demo_collection.add(
                             documents=[task_name], 
                             metadatas=[{
                                 "timestamp": datetime.datetime.now().isoformat(),
-                                "steps": json.dumps(current_recording_session)
+                                "steps": json.dumps(final_steps)
                             }],
                             ids=[f"demo_{datetime.datetime.now().timestamp()}"]
                         )
-                        save_raw_log({"type": "demo_saved", "name": task_name, "steps_count": len(current_recording_session)})
-                        print(f"💾 Demo Saved: {task_name}")
-                        await websocket.send_text(json.dumps({"action": "message", "value": f"Skill Learned: {task_name}"}))
+                        save_raw_log({"type": "demo_saved", "name": task_name, "steps_count": len(final_steps)})
+                        await websocket.send_text(json.dumps({"action": "message", "value": f"Skill Saved: {task_name}"}))
                         current_recording_session = [] 
                     continue
 
-                # --- C. Handle Instruction (Router) ---
+                # D. Instruction
                 if 'instruction' in payload:
                     user_msg = payload.get("instruction")
                     dom_tree = payload.get("dom")
-                    mode = payload.get("mode", "task") # 'chat' or 'task'
+                    mode = payload.get("mode", "task")
                     is_new_task = payload.get("is_new_task", False)
 
                     if not dom_tree:
                         await websocket.send_text(json.dumps({"action": "message", "value": "⚠️ UI Retrieval Failed"}))
                         continue
 
-                    # 👉 Chat Mode
                     if mode == 'chat':
                         response = await ask_brain_chat(user_msg, dom_tree, session_id)
                         await websocket.send_text(response)
-                    
-                    # 👉 Task Mode
                     else:
                         if is_new_task:
-                            session_step_history[session_id] = [] 
-                            print("🔄 Starting New Task")
+                            session_step_history[session_id] = []
+                            # Keep session blacklist alive
+                            print("🔄 New Task Started")
 
-                        last_context_cache[session_id] = {"goal": user_msg, "dom_summary": dom_tree[:500]}
+                        last_context_cache[session_id] = {"goal": user_msg, "dom_summary": dom_tree[:500], "full_dom": dom_tree}
                         
-                        action_json_str = await ask_brain_task(user_msg, dom_tree, session_id, session_step_history[session_id])
+                        action_json_str = await ask_brain_task(
+                            user_msg, 
+                            dom_tree, 
+                            session_id, 
+                            session_step_history[session_id],
+                            session_blacklists[session_id]
+                        )
                         
                         try:
                             act_data = json.loads(action_json_str)
+                            # Only log interactive actions with valid numeric IDs
                             if act_data.get('action') in ['click', 'type', 'select']:
-                                log = f"{act_data['action']} ID {act_data['id']}"
-                                session_step_history[session_id].append(log)
+                                if str(act_data.get('id')).isdigit():
+                                    log = f"{act_data['action']} ID {act_data['id']}"
+                                    session_step_history[session_id].append(log)
                         except: pass
 
-                        print(f"🤖 Task Action: {action_json_str}")
+                        print(f"🤖 Action: {action_json_str}")
                         await websocket.send_text(action_json_str)
 
-                # --- D. Feedback ---
+                # E. Feedback
                 if msg_type == 'feedback':
                     rating = payload.get('rating')
-                    action_taken = json.dumps(payload.get('action'))
+                    action_data = payload.get('action') 
                     context = last_context_cache.get(session_id)
+                    
+                    # Update Context Bans (Only if ID is numeric)
+                    if rating < 0 and action_data and 'id' in action_data and context:
+                        bad_id = str(action_data['id'])
+                        if bad_id.isdigit():
+                            ctx_hash = get_context_fingerprint(context['full_dom'])
+                            if ctx_hash not in session_blacklists[session_id]:
+                                session_blacklists[session_id][ctx_hash] = set()
+                            session_blacklists[session_id][ctx_hash].add(bad_id)
+                            print(f"🚫 Instant Context Ban: ID {bad_id} on Screen Hash [{ctx_hash[:6]}]")
+
                     if context:
                         rl_collection.add(
                             documents=[f"Goal: {context['goal']}\nUI: {context['dom_summary']}"],
-                            metadatas=[{"action": action_taken, "reward": rating}],
+                            metadatas=[{"action": json.dumps(action_data), "reward": rating}],
                             ids=[f"rl_{datetime.datetime.now().timestamp()}"]
                         )
-                        save_raw_log({
-                            "type": "feedback_event",
-                            "rating": rating,
-                            "action": payload.get('action'),
-                            "context": context
-                        })
-                        print(f"📈 [RL] Feedback: {rating}")
+                        save_raw_log({"type": "feedback_event", "rating": rating, "action": action_data})
+                        print(f"📈 Feedback: {rating}")
 
             except json.JSONDecodeError: pass
             
     except WebSocketDisconnect:
         if session_id in session_step_history: del session_step_history[session_id]
         if session_id in chat_history_cache: del chat_history_cache[session_id]
+        if session_id in session_blacklists: del session_blacklists[session_id]
         print(f"🔌 Connection Closed")
     except Exception as e:
         print(f"❌ Exception: {e}")
 
 if __name__ == "__main__":
-    print("🚀 Agent Server Starting...")
+    print("🚀 Server Starting...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
