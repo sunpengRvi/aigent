@@ -1,105 +1,105 @@
-import { Injectable } from '@angular/core';
+import { Injectable, OnDestroy } from '@angular/core';
 import { AgentService } from './agent.service';
 
 @Injectable({
   providedIn: 'root'
 })
-export class RecordingService {
+export class RecordingService implements OnDestroy {
   private isRecording = false;
   private socket: WebSocket | null = null;
-  
-  // Store references to bound listeners for removal
-  private clickListener: any;
-  private inputListener: any;
+  private eventListeners: any[] = [];
 
-  constructor(private agentService: AgentService) {
-    // Pre-bind context
-    this.clickListener = this.handleClick.bind(this);
-    this.inputListener = this.handleInput.bind(this);
-  }
+  constructor(private agentService: AgentService) {}
 
-  public setSocket(ws: WebSocket) {
+  setSocket(ws: WebSocket) {
     this.socket = ws;
   }
 
-  /**
-   * Start recording
-   * Use capture phase (true) to catch events before business logic stops propagation
-   */
-  public startRecording() {
-    if (this.isRecording) return;
+  startRecording() {
     this.isRecording = true;
-    console.log('TZ 🔴 Recording started...');
-    
-    document.addEventListener('click', this.clickListener, true);
-    document.addEventListener('change', this.inputListener, true);
+    this.attachListeners();
+    console.log('[Recorder] Started');
   }
 
-  /**
-   * Stop recording
-   */
-  public stopRecording() {
+  stopRecording() {
     this.isRecording = false;
-    console.log('TZ ⏹️ Recording stopped');
-    
-    document.removeEventListener('click', this.clickListener, true);
-    document.removeEventListener('change', this.inputListener, true);
+    this.removeListeners();
+    console.log('[Recorder] Stopped');
   }
 
-  // --- Event Handlers ---
+  private attachListeners() {
+    this.removeListeners(); 
 
-  private handleClick(event: MouseEvent) {
-    const target = event.target as HTMLElement;
-    // Ignore clicks inside the Agent Chat window itself
-    if (target.closest('.agent-chat-container')) return;
+    // 1. Click Listener (Buttons, Links)
+    const clickHandler = (e: MouseEvent) => {
+      if (!this.isRecording) return;
+      const target = e.target as HTMLElement;
+      
+      if (target.closest('.agent-chat-container')) return;
+      
+      // Ignore inputs/selects in click handler, they have their own events
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return;
 
-    this.processEvent('click', target);
-  }
-
-  private handleInput(event: Event) {
-    const target = event.target as HTMLElement;
-    // Ignore input inside the Agent Chat window itself
-    if (target.closest('.agent-chat-container')) return;
-    
-    let value = '';
-    // Get value from Input, Textarea, or Select
-    if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) {
-        value = target.value;
-    }
-    this.processEvent('type', target, value);
-  }
-
-  /**
-   * Core Logic: Convert DOM events into semantic Agent records
-   */
-  private processEvent(actionType: string, el: HTMLElement, value: string = '') {
-    // 1. Ensure ID exists (Assign temporary ID if the page hasn't been scanned yet)
-    let agentId = el.getAttribute('data-agent-id');
-    if (!agentId) {
-        agentId = `REC-${Date.now()}`;
-        el.setAttribute('data-agent-id', agentId);
-    }
-
-    // 2. 🔥 Critical: Get "Semantic Description" of the element
-    // Call the public method from AgentService (v6) to ensure the recorded data 
-    // includes hierarchy context (e.g., [Card > Header] Button)
-    const desc = this.agentService.getElementDescription(el);
-
-    const recordData = {
-        type: 'record_event',
-        timestamp: Date.now(),
-        url: window.location.href,
-        action: {
-            type: actionType,
-            target_id: agentId, 
-            value: value
-        },
-        element_desc: desc  // This is the training material for DeepSeek
+      this.recordAction('click', target);
     };
 
-    // 3. Send to Python Backend for storage
-    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-        this.socket.send(JSON.stringify(recordData));
-    }
+    // 2. Change Listener (Select, Checkbox, Radio, Finalized Input)
+    const changeHandler = (e: Event) => {
+      if (!this.isRecording) return;
+      const target = e.target as HTMLElement;
+
+      // A. Handle Select
+      if (target.tagName === 'SELECT') {
+        const selectEl = target as HTMLSelectElement;
+        const selectedOption = selectEl.options[selectEl.selectedIndex];
+        // Record the visible text ("Three")
+        this.recordAction('select', target, selectedOption.text.trim());
+      }
+      
+      // B. Handle Text Input (on change/blur)
+      else if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') {
+          const inputEl = target as HTMLInputElement;
+          // Ignore checkbox/radio here if you prefer clicks, but 'change' is safer for state
+          if (inputEl.type !== 'checkbox' && inputEl.type !== 'radio') {
+             this.recordAction('type', target, inputEl.value);
+          }
+      }
+    };
+
+    document.addEventListener('click', clickHandler, true);
+    document.addEventListener('change', changeHandler, true); 
+
+    this.eventListeners.push(
+      { type: 'click', fn: clickHandler },
+      { type: 'change', fn: changeHandler }
+    );
+  }
+
+  private removeListeners() {
+    this.eventListeners.forEach(l => document.removeEventListener(l.type, l.fn, true));
+    this.eventListeners = [];
+  }
+
+  private recordAction(type: string, el: HTMLElement, value: string = '') {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+
+    const desc = this.agentService.getElementDescription(el);
+    
+    const payload = {
+      type: 'record_event',
+      action: {
+        type: type, 
+        value: value
+      },
+      element_desc: desc,
+      timestamp: Date.now()
+    };
+
+    console.log(`[Recorder] Sending: ${type} on "${desc}" (Val: ${value})`);
+    this.socket.send(JSON.stringify(payload));
+  }
+
+  ngOnDestroy() {
+    this.removeListeners();
   }
 }

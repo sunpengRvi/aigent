@@ -48,6 +48,7 @@ def clean_ai_response(content):
     """Robustly extract JSON."""
     try:
         print(f"\n🧠 [AI Reasoning]:\n{content}\n")
+        
         json_match = re.search(r'```json\s*(\{.*?\})\s*```', content, re.DOTALL)
         if json_match:
             json_str = json_match.group(1)
@@ -58,14 +59,17 @@ def clean_ai_response(content):
 
         data = json.loads(json_str)
         
-        # Normalize keys
         if 'action' in data and data['action'] in ['finish', 'return', 'done']:
             return json.dumps({"action": "message", "value": "Task Completed"})
+
+        # Sanitize Action
+        if 'action' in data and '|' in data['action']:
+            data['action'] = 'click'
 
         if 'id' in data:
             match = re.search(r'(\d+)', str(data['id']))
             if match: data['id'] = match.group(1)
-            else: data['id'] = "INVALID_ID"
+            else: pass 
 
         if 'value' not in data:
             if 'message' in data: data['value'] = data['message']
@@ -88,31 +92,72 @@ def get_context_fingerprint(dom_str):
     skeleton = "|".join(tokens[:300]) 
     return hashlib.md5(skeleton.encode('utf-8')).hexdigest()
 
-# Helper: Check if text exists in DOM
+def find_id_by_desc(desc, dom_str):
+    if not desc: return None
+    clean_desc = desc.replace("[Sidebar]", "").replace("[Header]", "").strip()
+    clean_desc = re.escape(clean_desc)
+    pattern = re.compile(rf'\[(\d+)\]\s*<[^>]+>\s*".*?{clean_desc}.*?"', re.IGNORECASE)
+    match = pattern.search(dom_str)
+    if match: return match.group(1)
+    return None
+
+def verify_id_in_dom(target_id, dom_str):
+    pattern = re.compile(rf'\[{target_id}\].*?\"(.*?)\"', re.IGNORECASE)
+    match = pattern.search(dom_str)
+    if not match: return False, None
+    return True, match.group(1)
+
+def is_select_element(target_id, dom_str):
+    pattern = re.compile(rf'\[{target_id}\]\s*<select', re.IGNORECASE)
+    if pattern.search(dom_str): return True
+    return False
+
+def resolve_dom_id(target_id, dom_str):
+    raw_id = str(target_id).strip()
+    if raw_id.isdigit(): return raw_id
+    try:
+        clean = re.escape(raw_id)
+        pattern = re.compile(rf'\[(\d+)\][^>]*\b(?:id|name|data-testid)=[\"\']{clean}[\"\']', re.IGNORECASE)
+        match = pattern.search(dom_str)
+        if match: return match.group(1)
+    except: pass
+    return raw_id
+
+def is_state_satisfied(target_id, action_type, target_val, dom_str):
+    try:
+        pattern = re.compile(rf'\[{target_id}\].*?$', re.MULTILINE | re.IGNORECASE)
+        match = pattern.search(dom_str)
+        if not match: return False
+        
+        line = match.group(0)
+        
+        if action_type == 'click':
+            if "[Active]" in line or 'class="active"' in line: return True
+        
+        if action_type in ['select', 'type'] and target_val:
+            if f'Selected: "{target_val}"' in line: return True
+            if f'Value: "{target_val}"' in line: return True
+            if action_type == 'select' and target_val.lower() in line.lower() and "Selected:" in line:
+                return True
+    except: pass
+    return False
+
 def find_element_in_dom(desc, dom_str):
     clean_desc = desc.replace("[Sidebar]", "").replace("[Header]", "").strip()
     if clean_desc in dom_str: return True
     return False
 
-# 🔥 Helper: Check if the element matching the description is ACTIVE
-def is_target_active(desc, dom_str):
-    """
-    Checks if the DOM line containing 'desc' also contains '[Active]'.
-    """
+def is_target_active_or_selected(desc, target_val, dom_str):
     clean_desc = desc.replace("[Sidebar]", "").replace("[Header]", "").strip()
-    # Find line containing the description
-    # Regex: [ID] ... desc ...
-    # We escape clean_desc to handle special chars
     try:
-        # Simple string check first for speed
         if clean_desc not in dom_str: return False
-        
-        # Look for the specific line
         lines = dom_str.split('\n')
         for line in lines:
             if clean_desc in line:
-                if "[Active]" in line or 'class="active"' in line:
-                    return True
+                if "[Active]" in line or 'class="active"' in line: return True
+                if target_val:
+                    if f'Selected: "{target_val}"' in line: return True
+                    if f'Value: "{target_val}"' in line: return True
     except: pass
     return False
 
@@ -124,176 +169,189 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
     
     current_hash = get_context_fingerprint(dom_state)
     context_specific_bans = instant_bans_map.get(current_hash, set())
-    if context_specific_bans:
-        print(f"🚫 Bans Active: {list(context_specific_bans)}")
+    if context_specific_bans: print(f"🚫 Bans Active: {list(context_specific_bans)}")
 
     # 1. Loop Detection
-    if len(history_logs) >= 4:
+    if len(history_logs) >= 6: # Give more room for exploration
         last_three = history_logs[-3:]
         if last_three[0] == last_three[1] == last_three[2]:
             return json.dumps({"action": "message", "value": "Task Completed (Loop Detected)"})
 
-    # 2. RAG Retrieval & Smart Logic
-    demo_prompt = ""
-    current_step_target = None
+    # 2. RAG Retrieval & Dynamic Cursor
+    demo_info = ""
     should_stop = False
     
     try:
         demo_results = demo_collection.query(query_texts=[user_goal], n_results=1)
         if demo_results['documents'] and len(demo_results['documents'][0]) > 0:
+            demo_task_name = demo_results['documents'][0][0]
             steps = json.loads(demo_results['metadatas'][0][0]['steps'])
             total_steps = len(steps)
             
-            # A. Smart Step Selection (Reverse Goal Seek)
-            target_step_idx = -1
+            # 🔥🔥 DYNAMIC CURSOR: Determine where we are based on UI, NOT History
+            cursor_idx = -1
             
-            # Check backwards: Is the Final Step visible?
+            # 1. Reverse Check: Are we already at a later step?
             for idx in range(total_steps - 1, -1, -1):
                 step = steps[idx]
                 desc = step.get('element_desc', '')
                 if find_element_in_dom(desc, dom_state):
-                    target_step_idx = idx
-                    break 
+                    cursor_idx = idx
+                    break # Found the furthest visible step
             
-            if target_step_idx == -1:
-                target_step_idx = len(history_logs)
+            # 2. Fallback: If no future steps visible, default to start (or handle lost state)
+            # We don't rely on history length because user might have clicked around.
+            if cursor_idx == -1:
+                # If nothing visible, maybe we are at start? Or completely lost?
+                # Check if we have history. If history is empty, assume start (0).
+                # If history exists, maybe we keep looking for Step 0?
+                cursor_idx = 0 
 
-            # 🔥🔥 B. ZERO-CLICK COMPLETION CHECK
-            # If we are targeting the Final Step (or beyond), check if it is ALREADY ACTIVE.
-            if target_step_idx == total_steps - 1:
-                target_step = steps[target_step_idx]
+            # 3. State Completion Check (Zero-Click)
+            # If the cursor points to the last step, check if it's already done
+            if cursor_idx == total_steps - 1:
+                target_step = steps[cursor_idx]
                 desc = target_step.get('element_desc', '')
-                
-                if is_target_active(desc, dom_state):
-                    print(f"🎉 Goal '{desc}' is already [Active]. Task Completed!")
-                    return json.dumps({"action": "message", "value": "Task Completed (Goal Already Active)"})
+                target_val = target_step.get('action', {}).get('value', '')
+                if is_target_active_or_selected(desc, target_val, dom_state):
+                    # Only complete if goals match, otherwise might need value adaptation
+                    if user_goal.lower() == demo_task_name.lower():
+                        return json.dumps({"action": "message", "value": "Task Completed (Goal State Active)"})
 
-            # C. Smart Stop (History Check)
-            if history_logs and steps:
-                if len(history_logs) >= total_steps + 1:
-                    should_stop = True
-            
-            if target_step_idx < total_steps:
-                target_step = steps[target_step_idx]
+            # 4. Soft Stop (Buffer Limit)
+            # Allow 2x buffer for exploration
+            if history_logs and len(history_logs) >= total_steps * 2 + 2:
+                should_stop = True
+                print(f"🛑 Buffer Stop: History({len(history_logs)}) exceeds Limit.")
+
+            # 5. Construct Guidance
+            if cursor_idx < total_steps:
+                target_step = steps[cursor_idx]
                 action_type = target_step.get('action', {}).get('type')
                 desc = target_step.get('element_desc', 'unknown')
-                current_step_target = f"{action_type} on \"{desc}\""
+                action_val = target_step.get('action', {}).get('value', '')
                 
-                demo_prompt = f"### 🟢 SMART OBJECTIVE:\n"
-                demo_prompt += f"Based on UI state, jump to Step {target_step_idx + 1} of {total_steps}.\n"
-                demo_prompt += f"TARGET: {current_step_target}\n"
+                # Find Hint
+                suggested_id = find_id_by_desc(desc, dom_state)
+                
+                adaptation_hint = ""
+                if user_goal.lower() != demo_task_name.lower() and action_type in ['select', 'type']:
+                    adaptation_hint = f"\n⚠️ ADAPTATION: User Goal is '{user_goal}'. REPLACE Demo Value '{action_val}' with User Goal."
+                
+                if suggested_id:
+                    adaptation_hint += f"\n💡 HINT: Target \"{desc}\" found at ID {suggested_id}."
+
+                demo_info = f"--- DYNAMIC GUIDANCE (Matching Step {cursor_idx + 1}/{total_steps}) ---\n"
+                demo_info += f"Recommended Action: {action_type}\n"
+                demo_info += f"Target: \"{desc}\"\n"
+                demo_info += f"Demo Value: \"{action_val}\"\n"
+                demo_info += adaptation_hint
+                
             else:
                 should_stop = True
-                demo_prompt = "### 🟢 STATUS:\nSteps appear complete.\n"
 
-    except Exception as e:
-        print(f"⚠️ RAG Demo Error: {e}")
+    except Exception as e: print(f"⚠️ RAG Error: {e}")
 
-    # 3. RAG Feedback
-    rl_prompt = ""
-    try:
-        rl_query = f"Goal: {user_goal}\nContext: {dom_state[:500]}"
-        rl_results = rl_collection.query(query_texts=[rl_query], n_results=5)
-        if rl_results['documents'] and len(rl_results['documents'][0]) > 0:
-            rl_prompt = "### 🔴 MISTAKES HISTORY:\n"
-            for i, meta in enumerate(rl_results['metadatas'][0]):
-                if meta['reward'] < 0:
-                    rl_prompt += f"❌ FAILED previously: {meta['action']}\n"
-            rl_prompt += "### END MISTAKES\n"
-    except: pass
-
-    # 4. System Prompt
+    # 3. Prompt
     instruction = ""
-    if should_stop:
-        instruction = "Task completed. Return 'Task Completed' immediately."
-    elif current_step_target:
-        instruction = f"Find element matching: [{current_step_target}]. Do NOT return 'Task Completed' yet."
-    else:
-        instruction = "Follow demo steps."
+    if should_stop: instruction = "Task limit reached. Check if goal is met or return 'Task Completed'."
+    elif demo_info: instruction = "Use DYNAMIC GUIDANCE to proceed. You may explore if needed, but prioritize the Guidance."
+    else: instruction = "No memory found. Analyze UI to solve."
 
     system_prompt = f"""
-    You are a precise web automation agent.
-    
-    {demo_prompt}
-    {rl_prompt}
+    You are an intelligent web automation agent.
     
     TASK: {instruction}
     
     🛑 RULES:
-    1. **BANNED IDs**: {list(context_specific_bans)}. DO NOT CLICK.
-    2. **SEMANTIC MATCH**: Use description to find the INTEGER ID.
-    3. **SMART SKIPPING**: If target is visible, click it.
-    4. **FINISH**: If {should_stop} is True, STOP and return "Task Completed".
+    1. **FLEXIBILITY**: The Guidance matches the current UI state. Follow it if it makes sense.
+    2. **ADAPT VALUES**: Change Demo Value if User Goal differs.
+    3. **ID FORMAT**: Use ONLY the INTEGER index from `[10]`.
+    4. **BANNED IDs**: {list(context_specific_bans)}.
+    5. **FINISH**: If task is clearly done, return "Task Completed".
     
     RESPONSE FORMAT:
-    Step 1: Identify target.
-    Step 2: Find matching ID.
+    Step 1: Analyze Guidance vs UI.
+    Step 2: Decide Value (Adapt if needed).
     Step 3: Output JSON.
-    
     ```json
     {{"action": "click", "id": "10", "value": "..."}}
     ```
     """
     
-    user_prompt = f"GOAL: {user_goal}\nCURRENT VISIBLE UI:\n{dom_state}"
+    user_prompt = f"GOAL: {user_goal}\nCURRENT VISIBLE UI:\n{dom_state}\n\n{demo_info}"
     
     try:
         response = await client.chat.completions.create(
             model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
             temperature=0.0
         )
         result_str = clean_ai_response(response.choices[0].message.content.strip())
         
-        # Validation Logic
+        # --- POST-PROCESSING ---
         try:
             res_json = json.loads(result_str)
-            
-            if res_json.get('action') == 'message':
-                return result_str
+            if res_json.get('action') == 'message': return result_str
 
-            target_id = str(res_json.get('id'))
-            
-            if not target_id.isdigit():
-                 return json.dumps({"action": "message", "value": "Error: AI generated invalid ID format."})
+            target_id = str(res_json.get('id', ''))
+            target_id = resolve_dom_id(target_id, dom_state)
+            res_json['id'] = target_id 
 
-            if target_id in context_specific_bans:
-                return json.dumps({"action": "message", "value": f"Blocked banned ID {target_id}."})
+            # 🔥 REMOVED HARD PYTHON OVERRIDE
+            # We trust the AI + Hint now. We don't force target_id = suggested_id.
             
-            # Repetitive Click Guard
+            if not target_id.isdigit(): return json.dumps({"action": "message", "value": f"Error: Invalid ID '{target_id}'."})
+            if target_id in context_specific_bans: return json.dumps({"action": "message", "value": f"Blocked banned ID {target_id}."})
+            
+            is_valid, real_text = verify_id_in_dom(target_id, dom_state)
+            if not is_valid: return json.dumps({"action": "message", "value": f"Error: ID {target_id} not found."})
+            
+            action_type = res_json.get('action')
+            target_val = res_json.get('value', '')
+
+            # Action Logic
+            if is_select_element(target_id, dom_state):
+                res_json['action'] = 'select'
+                action_type = 'select'
+            elif action_type == 'click':
+                res_json['value'] = real_text 
+
+            # State Check
+            if is_state_satisfied(target_id, action_type, target_val, dom_state):
+                return json.dumps({"action": "message", "value": "Task Completed (State Satisfied)"})
+
+            # Debounce
             if history_logs:
                 last_log = history_logs[-1]
-                if str(target_id) in last_log and res_json.get('action') == 'click':
-                    print(f"🛡️ Repetitive Click. Assuming Task Done.")
-                    return json.dumps({"action": "message", "value": "Task Completed"})
+                if str(target_id) in last_log:
+                    if action_type == 'click':
+                        return json.dumps({"action": "message", "value": "Task Completed"})
+                    elif action_type in ['select', 'type'] and target_val in last_log:
+                         return json.dumps({"action": "message", "value": "Task Completed"})
+            
+            return json.dumps(res_json)
 
-        except: pass
+        except Exception as e:
+            pass
 
         return result_str
 
-    except Exception as e:
-        return json.dumps({"action": "error", "value": f"Task AI Error: {str(e)}"})
+    except Exception as e: return json.dumps({"action": "error", "value": f"Task AI Error: {str(e)}"})
 
 # ==========================================
 # 5. Chat Brain
 # ==========================================
 async def ask_brain_chat(user_msg, dom_state, session_id):
-    print(f"💬 [Chat Brain] User: {user_msg}")
-    if session_id not in chat_history_cache:
-        chat_history_cache[session_id] = [{"role": "system", "content": "You are a versatile AI assistant."}]
+    if session_id not in chat_history_cache: chat_history_cache[session_id] = [{"role": "system", "content": "Assistant."}]
     history = chat_history_cache[session_id]
-    history.append({"role": "user", "content": f"[Context]:\n{dom_state[:1000]}\n[Q]: {user_msg}"})
+    history.append({"role": "user", "content": f"Context:\n{dom_state[:500]}\nQ: {user_msg}"})
     try:
         res = await client.chat.completions.create(model=MODEL_NAME, messages=history, temperature=0.7)
         reply = res.choices[0].message.content
-        if "<think>" in reply: reply = reply.split("</think>")[-1].strip()
         history.append({"role": "assistant", "content": reply})
         return json.dumps({"action": "message", "value": reply})
-    except Exception as e:
-        return json.dumps({"action": "message", "value": f"Chat Error: {str(e)}"})
+    except Exception as e: return json.dumps({"action": "message", "value": str(e)})
 
 # ==========================================
 # 6. WebSocket Endpoint
@@ -303,10 +361,8 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     session_id = str(id(websocket))
     global current_recording_session
-    
     if session_id not in session_step_history: session_step_history[session_id] = []
     if session_id not in session_blacklists: session_blacklists[session_id] = {} 
-    
     print(f"✅ Frontend Connected (Session: {session_id})")
     
     try:
@@ -316,56 +372,47 @@ async def websocket_endpoint(websocket: WebSocket):
                 payload = json.loads(raw_data)
                 msg_type = payload.get('type')
 
-                # A. Record
                 if msg_type == 'record_event':
                     current_recording_session.append(payload)
+                    payload['type'] = 'feedback_event' 
                     save_raw_log(payload)
-                    print(f"📹 [Rec] {payload.get('action',{}).get('type')}")
+                    print(f"📹 [Rec] {payload.get('action',{}).get('type')} on {payload.get('element_desc')}") 
                     continue
 
-                # B. Preview
                 if msg_type == 'request_preview':
                     await websocket.send_text(json.dumps({"action": "preview_data", "data": current_recording_session}))
                     continue
 
-                # C. Save Demo
                 if msg_type == 'save_demo':
                     task_name = payload.get('name')
                     final_steps = payload.get('steps') or current_recording_session
                     if final_steps:
                         demo_collection.add(
                             documents=[task_name], 
-                            metadatas=[{
-                                "timestamp": datetime.datetime.now().isoformat(),
-                                "steps": json.dumps(final_steps)
-                            }],
+                            metadatas=[{"timestamp": datetime.datetime.now().isoformat(), "steps": json.dumps(final_steps)}],
                             ids=[f"demo_{datetime.datetime.now().timestamp()}"]
                         )
-                        save_raw_log({"type": "demo_saved", "name": task_name, "steps_count": len(final_steps)})
+                        save_raw_log({"type": "demo_saved", "name": task_name, "steps": len(final_steps)})
                         await websocket.send_text(json.dumps({"action": "message", "value": f"Skill Saved: {task_name}"}))
                         current_recording_session = [] 
                     continue
 
-                # D. Instruction
                 if 'instruction' in payload:
                     user_msg = payload.get("instruction")
                     dom_tree = payload.get("dom")
                     mode = payload.get("mode", "task")
                     is_new_task = payload.get("is_new_task", False)
-
                     if not dom_tree:
-                        await websocket.send_text(json.dumps({"action": "message", "value": "⚠️ UI Retrieval Failed"}))
+                        await websocket.send_text(json.dumps({"action": "message", "value": "UI Error"}))
                         continue
-
                     if mode == 'chat':
-                        response = await ask_brain_chat(user_msg, dom_tree, session_id)
-                        await websocket.send_text(response)
+                        await websocket.send_text(await ask_brain_chat(user_msg, dom_tree, session_id))
                     else:
                         if is_new_task:
                             session_step_history[session_id] = []
-                            # Keep session blacklist alive
+                            session_blacklists[session_id] = {} # Clear bans on new task
                             print("🔄 New Task Started")
-
+                        
                         last_context_cache[session_id] = {"goal": user_msg, "dom_summary": dom_tree[:500], "full_dom": dom_tree}
                         
                         action_json_str = await ask_brain_task(
@@ -378,23 +425,21 @@ async def websocket_endpoint(websocket: WebSocket):
                         
                         try:
                             act_data = json.loads(action_json_str)
-                            # Only log interactive actions with valid numeric IDs
                             if act_data.get('action') in ['click', 'type', 'select']:
                                 if str(act_data.get('id')).isdigit():
-                                    log = f"{act_data['action']} ID {act_data['id']}"
+                                    val = act_data.get('value', '')
+                                    log = f"{act_data['action']} ID {act_data['id']} (Val: {val})"
                                     session_step_history[session_id].append(log)
                         except: pass
 
                         print(f"🤖 Action: {action_json_str}")
                         await websocket.send_text(action_json_str)
 
-                # E. Feedback
                 if msg_type == 'feedback':
                     rating = payload.get('rating')
                     action_data = payload.get('action') 
                     context = last_context_cache.get(session_id)
                     
-                    # Update Context Bans (Only if ID is numeric)
                     if rating < 0 and action_data and 'id' in action_data and context:
                         bad_id = str(action_data['id'])
                         if bad_id.isdigit():
@@ -402,7 +447,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             if ctx_hash not in session_blacklists[session_id]:
                                 session_blacklists[session_id][ctx_hash] = set()
                             session_blacklists[session_id][ctx_hash].add(bad_id)
-                            print(f"🚫 Instant Context Ban: ID {bad_id} on Screen Hash [{ctx_hash[:6]}]")
+                            print(f"🚫 Ban ID {bad_id}")
 
                     if context:
                         rl_collection.add(
@@ -416,10 +461,10 @@ async def websocket_endpoint(websocket: WebSocket):
             except json.JSONDecodeError: pass
             
     except WebSocketDisconnect:
-        if session_id in session_step_history: del session_step_history[session_id]
+        print(f"🔌 Closed Session {session_id}")
+        del session_step_history[session_id]
         if session_id in chat_history_cache: del chat_history_cache[session_id]
         if session_id in session_blacklists: del session_blacklists[session_id]
-        print(f"🔌 Connection Closed")
     except Exception as e:
         print(f"❌ Exception: {e}")
 
