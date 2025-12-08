@@ -62,22 +62,33 @@ export class AgentChatComponent implements OnInit, OnDestroy {
     this.connectionStatus = 'Connecting...';
     
     try {
-        this.socket = new WebSocket('ws://localhost:8000/ws');
+        const ws = new WebSocket('ws://localhost:8000/ws');
+        this.socket = ws;
 
-        this.socket.onopen = () => {
+        ws.onopen = () => {
           this.isConnected = true;
           if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
           
           this.connectionStatus = '🟢 Connected';
           
-          if (this.socket) this.recordingService.setSocket(this.socket);
+          this.recordingService.setSocket(ws);
+
+          // 🔥 Send Sitemap Skeleton
+          const routeInfo = this.agentService.getRouteInfo();
+          ws.send(JSON.stringify({
+            type: 'sitemap_init',
+            routes: routeInfo.routes,
+            version: routeInfo.version_hash
+          }));
+          console.log('[Agent] Sitemap Skeleton sent.');
         };
 
-        this.socket.onmessage = (event) => this.handleIncomingMessage(event.data);
+        ws.onmessage = (event) => this.handleIncomingMessage(event.data);
 
-        this.socket.onclose = () => {
+        ws.onclose = () => {
           this.isConnected = false;
           this.autoRunning = false; 
+          this.socket = null;
           
           if (this.isComponentAlive) {
               this.connectionStatus = '🔴 Disconnected';
@@ -90,9 +101,9 @@ export class AgentChatComponent implements OnInit, OnDestroy {
           }
         };
 
-        this.socket.onerror = (err) => {
+        ws.onerror = (err) => {
             console.error('[Agent] WebSocket Error:', err);
-            this.socket?.close();
+            ws.close();
         };
 
     } catch (e) {
@@ -109,24 +120,20 @@ export class AgentChatComponent implements OnInit, OnDestroy {
       const cmd = JSON.parse(jsonStr);
       const msgId = Date.now().toString();
 
-      // 1. Handle Preview Data (Review Mode)
       if (cmd.action === 'preview_data') {
           this.reviewSteps = cmd.data;
           this.isReviewing = true;
           return;
       }
 
-      // 2. Handle Text Messages & Completion Signals
-      // 🔥 FIX: Accept 'return', 'finish', 'done' as valid completion signals from LLM
       if (['message', 'return', 'finish', 'done'].includes(cmd.action)) {
         const text = cmd.value || 'Task Completed';
         this.messages.push({ id: msgId, type: 'agent', text: text });
         
-        if (this.autoRunning) {
+        if (this.autoRunning && text.includes('Task Completed')) {
           this.stopAutoRun('Task Completed by AI');
         }
       } 
-      // 3. Handle Actions
       else if (['click', 'type', 'select'].includes(cmd.action)) {
         const result = this.agentService.executeCommand(cmd.action, cmd.id, cmd.value);
         
@@ -158,7 +165,7 @@ export class AgentChatComponent implements OnInit, OnDestroy {
   // --- Auto-Loop ---
   triggerNextStep() {
     this.stepCount++;
-    if (this.stepCount > 20) {
+    if (this.stepCount > 30) { 
       this.stopAutoRun('Max step limit reached');
       return;
     }
@@ -175,14 +182,14 @@ export class AgentChatComponent implements OnInit, OnDestroy {
     this.messages.push({ id: Date.now().toString(), type: 'user', text: cmd });
     this.inputText = '';
 
-    // Local Debug Scan
+    // Local Debug
     if (cmd.toLowerCase() === 'scan' && this.currentMode === 'task') {
       const domSnapshot = this.agentService.scanPage();
       console.log(domSnapshot);
       this.messages.push({
         id: Date.now().toString() + '_scan',
         type: 'system',
-        text: `📄 Scan Complete (${domSnapshot.split('\n').length} elements)\n(Check console)`
+        text: `📄 Scan Complete (${domSnapshot.split('\n').length} elements)`
       });
       return;
     }
@@ -203,18 +210,24 @@ export class AgentChatComponent implements OnInit, OnDestroy {
     }
   }
 
+  // 🔥 UPDATED: Sends Semantic Structure
   sendToBackend(task: string, isNewTask: boolean) {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
         this.stopAutoRun("Connection lost");
         return;
     }
+    
     const dom = this.agentService.scanPage();
+    const pageStructure = this.agentService.getPageStructure();
+
     this.socket.send(JSON.stringify({
       instruction: task,
       dom: dom,
+      page_structure: pageStructure, // Sent to backend
       mode: this.currentMode,
       is_new_task: isNewTask
     }));
+    
     this.scrollToBottom();
   }
 
@@ -242,10 +255,7 @@ export class AgentChatComponent implements OnInit, OnDestroy {
     }
   }
 
-  // Review Actions
-  removeStep(index: number) {
-      this.reviewSteps.splice(index, 1);
-  }
+  removeStep(index: number) { this.reviewSteps.splice(index, 1); }
 
   confirmSave() {
       if (this.socket && this.socket.readyState === WebSocket.OPEN) {
@@ -266,14 +276,9 @@ export class AgentChatComponent implements OnInit, OnDestroy {
       this.messages.push({ id: 'rec_cancel', type: 'system', text: '⚠️ Save cancelled.' });
   }
 
-  // --- Helpers ---
   setMode(mode: 'chat' | 'task') {
     this.currentMode = mode;
-    this.messages.push({
-      id: Date.now().toString(),
-      type: 'system',
-      text: mode === 'chat' ? '💬 Chat Mode' : '⚡ Task Mode'
-    });
+    this.messages.push({ id: Date.now().toString(), type: 'system', text: mode === 'chat' ? '💬 Chat Mode' : '⚡ Task Mode' });
   }
 
   toggleMinimize(e: Event) {
@@ -311,10 +316,7 @@ export class AgentChatComponent implements OnInit, OnDestroy {
   ngOnDestroy() {
     this.isComponentAlive = false; 
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    
-    if (this.socket) {
-        this.socket.close();
-    }
+    if (this.socket) this.socket.close();
     this.recordingService.stopRecording();
   }
 }
