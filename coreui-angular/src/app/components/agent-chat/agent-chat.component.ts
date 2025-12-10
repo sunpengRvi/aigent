@@ -28,18 +28,15 @@ export class AgentChatComponent implements OnInit, OnDestroy {
     { id: 'init', type: 'agent', text: '👋 AI Assistant Ready.\n\n• Chat Mode: Ask about page\n• Task Mode: Execute instructions' }
   ];
 
-  // State flags
   isRecording = false;
   isConnected = false;
   autoRunning = false;
   isMinimized = false;
   
-  // Review Mode State
   isReviewing = false;
   reviewSteps: any[] = [];
   reviewTaskName = '';
 
-  // UI Status
   connectionStatus = 'Connecting...';
   currentMode: 'chat' | 'task' = 'chat';
   currentTask = '';
@@ -55,7 +52,6 @@ export class AgentChatComponent implements OnInit, OnDestroy {
 
   ngOnInit() { this.connectWebSocket(); }
 
-  // --- WebSocket Connection ---
   connectWebSocket() {
     if (this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) return;
 
@@ -73,7 +69,6 @@ export class AgentChatComponent implements OnInit, OnDestroy {
           
           this.recordingService.setSocket(ws);
 
-          // 🔥 Send Sitemap Skeleton
           const routeInfo = this.agentService.getRouteInfo();
           ws.send(JSON.stringify({
             type: 'sitemap_init',
@@ -114,7 +109,6 @@ export class AgentChatComponent implements OnInit, OnDestroy {
     }
   }
 
-  // --- Message Handling ---
   handleIncomingMessage(jsonStr: string) {
     try {
       const cmd = JSON.parse(jsonStr);
@@ -126,35 +120,71 @@ export class AgentChatComponent implements OnInit, OnDestroy {
           return;
       }
 
-      if (['message', 'return', 'finish', 'done'].includes(cmd.action)) {
+      // Handle completion AND failure signals
+      if (['message', 'return', 'finish', 'done', 'error'].includes(cmd.action)) {
         const text = cmd.value || 'Task Completed';
-        this.messages.push({ id: msgId, type: 'agent', text: text });
         
-        if (this.autoRunning && text.includes('Task Completed')) {
-          this.stopAutoRun('Task Completed by AI');
+        this.messages.push({ 
+            id: msgId, 
+            type: cmd.action === 'error' ? 'system' : 'agent', 
+            text: text 
+        });
+        
+        // Stop Loop Condition
+        if (this.autoRunning) {
+            const lowerText = text.toLowerCase();
+            if (
+                lowerText.includes('task completed') || 
+                lowerText.includes('task failed') || 
+                lowerText.includes('error') ||
+                cmd.action === 'finish' ||
+                cmd.action === 'error'
+            ) {
+                this.stopAutoRun(text);
+            }
         }
       } 
       else if (['click', 'type', 'select'].includes(cmd.action)) {
-        const result = this.agentService.executeCommand(cmd.action, cmd.id, cmd.value);
-        
-        this.messages.push({
-          id: msgId,
-          type: 'agent',
-          text: `Step ${this.stepCount}: ${result}`,
-          actionData: cmd, 
-          feedback: null
-        });
+          const result = this.agentService.executeCommand(cmd.action, cmd.id, cmd.value);
+          
+          this.messages.push({
+            id: msgId,
+            type: 'agent',
+            text: `Step ${this.stepCount}: ${result}`,
+            actionData: cmd, 
+            feedback: null
+          });
 
-        if (result.startsWith('❌')) {
-          this.messages.push({ id: msgId + '_fail', type: 'system', text: result });
-          this.sendFeedback(msgId, 'bad', cmd); 
-          this.stopAutoRun('Execution Error');
-        } else {
-          // Auto-Loop
-          if (this.autoRunning) {
-            this.triggerNextStep();
+          // 🔥🔥 RUNTIME GUARD: Check for Execution Errors 🔥🔥
+          if (result.startsWith('❌')) {
+            this.messages.push({ id: msgId + '_fail', type: 'system', text: result });
+            
+            if (this.autoRunning) {
+                console.warn('[Agent] Runtime Error, requesting correction from backend...');
+                
+                // 🔥🔥 FIX: Re-capture context IMMEDIATELY for the retry
+                // This ensures the AI sees the EXACT current state (fixes offset issues)
+                this.agentService.captureContext().then(contextData => {
+                    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+                        this.socket.send(JSON.stringify({
+                            type: 'client_error',
+                            error: result,
+                            // Send fresh data
+                            dom: contextData.dom,
+                            screenshot: contextData.screenshot,
+                            elements_meta: contextData.elements_meta
+                        }));
+                    }
+                });
+            } else {
+                this.stopAutoRun('Execution Error');
+            }
+          } else {
+            // Success case
+            if (this.autoRunning) {
+              this.triggerNextStep();
+            }
           }
-        }
       }
       this.scrollToBottom();
     } catch (e) {
@@ -162,10 +192,9 @@ export class AgentChatComponent implements OnInit, OnDestroy {
     }
   }
 
-  // --- Auto-Loop ---
   triggerNextStep() {
     this.stepCount++;
-    if (this.stepCount > 30) { 
+    if (this.stepCount > 30) {
       this.stopAutoRun('Max step limit reached');
       return;
     }
@@ -175,14 +204,12 @@ export class AgentChatComponent implements OnInit, OnDestroy {
     }, 2500);
   }
 
-  // --- Send Message ---
   send() {
     if (!this.inputText.trim()) return;
     const cmd = this.inputText.trim();
     this.messages.push({ id: Date.now().toString(), type: 'user', text: cmd });
     this.inputText = '';
 
-    // Local Debug
     if (cmd.toLowerCase() === 'scan' && this.currentMode === 'task') {
       const domSnapshot = this.agentService.scanPage();
       console.log(domSnapshot);
@@ -210,28 +237,31 @@ export class AgentChatComponent implements OnInit, OnDestroy {
     }
   }
 
-  // 🔥 UPDATED: Sends Semantic Structure
-  sendToBackend(task: string, isNewTask: boolean) {
+  async sendToBackend(task: string, isNewTask: boolean) {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
         this.stopAutoRun("Connection lost");
         return;
     }
     
-    const dom = this.agentService.scanPage();
-    const pageStructure = this.agentService.getPageStructure();
+    const contextData = await this.agentService.captureContext();
+    const currentUrl = window.location.hash || window.location.pathname; 
+    const title = document.title; 
 
     this.socket.send(JSON.stringify({
       instruction: task,
-      dom: dom,
-      page_structure: pageStructure, // Sent to backend
+      dom: contextData.dom,
+      page_structure: contextData.page_structure,
+      screenshot: contextData.screenshot,
+      elements_meta: contextData.elements_meta,
       mode: this.currentMode,
-      is_new_task: isNewTask
+      is_new_task: isNewTask,
+      url: currentUrl, 
+      title: title 
     }));
     
     this.scrollToBottom();
   }
 
-  // --- Recording & Review ---
   toggleRecording() {
     if (this.autoRunning) this.stopAutoRun('Switching to record');
 
