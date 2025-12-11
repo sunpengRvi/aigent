@@ -79,7 +79,6 @@ export class AgentService {
     };
     const elements = document.querySelectorAll('button, a, input, select, textarea, h1, h2, h3, h4, h5, h6');
     elements.forEach(el => {
-      // 结构树不需要严格的遮挡检测，基本可见即可
       if (!this.isVisible(el as HTMLElement)) return;
       const text = this.cleanText(el.textContent || (el as HTMLInputElement).value || '');
       if (!text && el.tagName !== 'INPUT' && el.tagName !== 'SELECT') return;
@@ -125,67 +124,116 @@ export class AgentService {
   }
 
   // =========================================================================
-  // 👁️ CV Capture Logic (Manual Crop Strategy)
+  // 👁️ CV Capture Logic (Fixed + Sticky Element Patch)
   // =========================================================================
   async captureContext(): Promise<any> {
-    // 0. 三重等待策略：确保页面渲染完毕
+    // 0. Wait Strategy
     if (document.readyState !== 'complete') {
         await new Promise(resolve => window.addEventListener('load', resolve, { once: true }));
     }
     await document.fonts.ready;
-    // 800ms 缓冲，确保 Angular 动画和 DOM 变更彻底完成
     await new Promise(resolve => setTimeout(resolve, 800)); 
     await new Promise(resolve => requestAnimationFrame(resolve));
 
-    // 1. 扫描页面 (使用严格的可见性检查)
+    // 1. Scan & Extract
     const domTree = this.scanPage();
     const pageStructure = this.getPageStructure();
-
-    // 2. 提取坐标 (相对于视口)
     const elementsMeta = this.extractElementCoordinates();
     
+    // Current Scroll & Viewport
     const vWidth = window.innerWidth;
     const vHeight = window.innerHeight;
+    const scrollY = window.scrollY;
+    const scrollX = window.scrollX;
 
     let screenshotBase64 = '';
     try {
-        // 🔥 Step A: 使用 html2canvas 截取整个 body
-        // scrollY: -window.scrollY 会将当前视口的内容“移”到画布的 (0,0) 位置
-        // 这样可以规避滚动条导致的偏移
-        const fullCanvas = await html2canvas(document.body, {
+        const canvas = await html2canvas(document.body, {
             useCORS: true,
             logging: false,
-            scale: 1, // 强制 1:1 比例，方便坐标对齐
-            scrollY: -window.scrollY, 
-            scrollX: -window.scrollX,
-            // 尝试限制渲染区域，虽然 html2canvas 有时会忽略，但值得加上
-            //width: vWidth,
-            //height: vHeight,
-            //windowWidth: vWidth,
-            //windowHeight: vHeight,
+            scale: 1,
+            // Align viewport top-left to canvas (0,0)
+            scrollY: -scrollY, 
+            scrollX: -scrollX,
+            width: vWidth,
+            height: vHeight,
+            windowWidth: vWidth,
+            windowHeight: vHeight,
+            
+            // 🔥🔥 FIX: Handle 'fixed' AND 'sticky' elements 🔥🔥
+            onclone: (clonedDoc) => {
+                const allElements = clonedDoc.getElementsByTagName('*');
+                
+                for (let i = 0; i < allElements.length; i++) {
+                    const el = allElements[i] as HTMLElement;
+                    const style = window.getComputedStyle(el);
+                    const position = style.position;
+
+                    // Only process Fixed or Sticky elements that are currently visible/active
+                    if (position === 'fixed' || position === 'sticky') {
+                        
+                        // 1. Calculate original position
+                        // Note: computed style 'top' might be 'auto', so we can't trust it fully.
+                        // But since we are freezing the current view, we want to freeze it exactly where it IS.
+                        const rect = el.getBoundingClientRect(); 
+                        
+                        // 2. 🔥 CREATE SPACER (Crucial for Sticky) 🔥
+                        // If we turn a sticky/fixed element to absolute, it leaves the flow.
+                        // We must insert a dummy div to hold its place and push content down.
+                        if (position === 'sticky') {
+                            const spacer = clonedDoc.createElement('div');
+                            spacer.style.display = style.display;
+                            spacer.style.width = style.width;
+                            spacer.style.height = style.height;
+                            spacer.style.marginTop = style.marginTop;
+                            spacer.style.marginBottom = style.marginBottom;
+                            spacer.style.marginLeft = style.marginLeft;
+                            spacer.style.marginRight = style.marginRight;
+                            spacer.style.padding = '0';
+                            spacer.style.border = 'none';
+                            spacer.style.visibility = 'hidden'; // Invisible placeholder
+                            
+                            // Insert before the element to occupy its original slot
+                            if (el.parentNode) {
+                                el.parentNode.insertBefore(spacer, el);
+                            }
+                        }
+
+                        // 3. Freeze the element visually to Absolute
+                        el.style.position = 'absolute';
+                        // Add scrollY because absolute is relative to document top
+                        // rect.top is relative to viewport top (which is what we want + scroll)
+                        el.style.top = (rect.top + scrollY) + 'px'; 
+                        el.style.left = (rect.left + scrollX) + 'px';
+                        
+                        // Lock dimensions to prevent collapse
+                        el.style.width = rect.width + 'px'; 
+                        el.style.height = rect.height + 'px';
+                        el.style.margin = '0'; // Margin is handled by the spacer or position
+                        el.style.bottom = 'auto'; 
+                        el.style.right = 'auto';
+                        el.style.transform = 'none'; 
+                    }
+                }
+            },
+            
             ignoreElements: (element) => {
                 return element.classList.contains('agent-chat-container') || 
                        element.tagName === 'VLAB-AGENT-CHAT'; 
             }
         });
 
-        // 🔥 Step B: 手动裁剪 (二次保障)
-        // 创建一个只包含当前视口大小的 Canvas，把 fullCanvas 的左上角画进去
+        // 🔥 Manual Crop (Double Safety)
         const viewportCanvas = document.createElement('canvas');
         viewportCanvas.width = vWidth;
         viewportCanvas.height = vHeight;
         const ctx = viewportCanvas.getContext('2d');
 
         if (ctx) {
-            // 从源画布的 (0,0) 复制到 目标画布的 (0,0)
-            ctx.drawImage(
-                fullCanvas, 
-                0, 0, vWidth, vHeight, 
-                0, 0, vWidth, vHeight
-            );
+            ctx.drawImage(canvas, 0, 0, vWidth, vHeight, 0, 0, vWidth, vHeight);
             screenshotBase64 = viewportCanvas.toDataURL('image/jpeg', 0.6);
         } else {
-            screenshotBase64 = fullCanvas.toDataURL('image/jpeg', 0.6);
+            screenshotBase64 = canvas.toDataURL('image/jpeg', 0.6);
         }
 
     } catch (e) {
@@ -204,12 +252,10 @@ export class AgentService {
     const metas: any[] = [];
     const elements = document.querySelectorAll('[data-agent-id]');
     
-    // 我们只需要视口内的元素
     const viewportWidth = window.innerWidth;
     const viewportHeight = window.innerHeight;
 
     elements.forEach(el => {
-        // 🔥 必须使用严格可见性检查 (Hit Testing)
         if (!this.isElementTrulyVisible(el as HTMLElement)) return;
 
         const id = el.getAttribute('data-agent-id');
@@ -218,8 +264,6 @@ export class AgentService {
         if (id) {
             metas.push({
                 id: parseInt(id, 10),
-                // 坐标直接取 rect，因为它是相对于视口左上角的
-                // 我们的截图也是强制对齐到视口左上角的，所以完美匹配
                 x: Math.round(rect.left),
                 y: Math.round(rect.top),
                 w: Math.round(rect.width),
@@ -234,43 +278,34 @@ export class AgentService {
   // ⚙️ Scanning & Execution
   // =========================================================================
   
-  // 🔥 严格的可见性检查 (Hit Testing + CSS + Bounds)
+  // 🔥 Strict Visibility Check
   private isElementTrulyVisible(el: HTMLElement): boolean {
-      // 1. 尺寸检查
       if (!el.offsetWidth || !el.offsetHeight) return false;
       const rect = el.getBoundingClientRect();
       
-      // 2. 视口边界检查 (完全在屏幕外的忽略)
+      // 1. Viewport Check
       if (rect.bottom < 0 || rect.top > window.innerHeight || 
           rect.right < 0 || rect.left > window.innerWidth) {
           return false;
       }
 
-      // 3. CSS 样式检查
+      // 2. CSS Check
       const style = window.getComputedStyle(el);
       if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity || '1') < 0.1) {
           return false;
       }
 
-      // 4. 遮挡检查 (Hit Test)
-      // 在元素中心点发射射线，看最顶层元素是不是自己
+      // 3. Occlusion Check
       const centerX = rect.left + rect.width / 2;
       const centerY = rect.top + rect.height / 2;
       
-      // 确保点在视口内
       if (centerX >= 0 && centerX <= window.innerWidth && centerY >= 0 && centerY <= window.innerHeight) {
           const topElement = document.elementFromPoint(centerX, centerY);
           if (!topElement) return false;
-          
-          // 如果点击到的是自己，或者自己的子/父元素，视为可见
           if (el.contains(topElement) || topElement.contains(el)) return true;
-          
-          // 特殊情况：Label 覆盖 Input (这在 Form 中很常见)
           if (topElement.tagName === 'LABEL' && (topElement as HTMLLabelElement).control === el) return true;
-          
-          return false; // 被弹窗、遮罩层或其他元素遮挡
+          return false;
       }
-
       return true;
   }
 
@@ -281,7 +316,6 @@ export class AgentService {
     elements.forEach((node) => {
       const el = node as HTMLElement;
       
-      // 🔥 使用严格检查过滤幽灵元素
       if (!this.isElementTrulyVisible(el)) return;
       if (el.closest('.agent-chat-container') || el.tagName === 'VLAB-AGENT-CHAT') return;
       
@@ -396,7 +430,7 @@ export class AgentService {
     setTimeout(() => { el.style.outline = originalOutline; }, 1000);
   }
 
-  // 🔥 Runtime Guard: 前端拦截逻辑
+  // 🔥 Runtime Guard
   executeCommand(action: string, id: string, value: string = ''): string {
     const el = document.querySelector(`[data-agent-id="${id}"]`) as HTMLElement;
     if (!el) return `❌ ID [${id}] not found`;

@@ -56,3 +56,6 @@ backend/agent_brain_db
 
 #trajectories
 *.jsonl
+
+backend/__pycache__
+backend/agent_datasets
