@@ -1,34 +1,37 @@
-这是一个非常清晰的战略规划时刻。如果不先把**“数据资产化”**的路径规划好，现在跑再多遍任务，也只是浪费电费，没有沉淀下“智慧”。
+```markdown
+# 🗺️ Road to AGI: 从“规则驱动”到“原生智能”路线图
 
-为了让现在的每一次点击、每一次纠错都成为未来微调（SFT）和强化学习（RL）的燃料，我们制定了这份 **“全息数据黑盒”构建路线图**。
-
-请过目，我们按这个单子一步步来。
+## 🏆 当前状态：第一阶段已完成 (Stage 1 Complete)
+**系统能力已升级**：具备全息数据录制能力，支持“全屏上下文 + 局部视觉锚点”的双重采集。
 
 ---
 
-### 🗺️ Road to AGI: 从“规则驱动”到“原生智能”路线图
-
-#### ✅ 第一阶段：全息数据记录 (The Holographic Recorder)
+### ✅ 第一阶段：全息数据记录 (The Holographic Recorder) [COMPLETED]
 **目标**：不再只是打印 Log，而是把 Agent 的每一次“思考-行动”循环变成标准化的训练样本。
 
-* **[ ] 1.1 构建 `DatasetRecorder` 模块 (后端)**
-    * **做什么**：不再覆盖保存 `latest_grounding.jpg`。而是按 `SessionID / StepID` 结构化保存每一帧。
-    * **存什么**：
-        * `Screenshot` (原始纯净图) -> 用于训练视觉特征。
-        * `Marked Screenshot` (带红框图) -> 用于训练 SoM 定位能力。
-        * `DOM Tree` + `Sitemap Hint` -> 作为输入的 Context。
-        * `Prompt` (我们发给 Qwen 的指令) -> 作为 Instruction。
-        * `Thinking Process` (DeepSeek 的 `<think>` 内容) -> **极其珍贵**，用于训练 CoT (思维链)。
-        * `Action` (最终 JSON) -> 作为 Label。
+* **[x] 1.1 构建 `DatasetRecorder` 模块 (后端)**
+    * **状态**：**已实装** (`backend/dataset_recorder.py`)
+    * **实现细节**：
+        * 实现了 `session_{timestamp}_{uuid}` 的结构化存储。
+        * **数据资产**：
+            * `raw_screenshot`: 原始纯净图 (用于视觉特征训练)。
+            * `marked_screenshot`: 带红框图 (用于 SoM 定位验证)。
+            * `visual_crop`: **[NEW]** 交互元素的特写切片 (用于训练 Visual Grounding)。
+            * `dom` + `prompt`: 完整的上下文输入。
+            * `response_raw`: 包含 DeepSeek `<think>` 的完整思维链 (CoT)。
+            * `action_json`: 结构化的动作标签。
+        * **性能优化**：实现了 Base64 图片的即时落盘 (`save_demo_image`)，内存中仅保留文件路径，防止长任务导致 OOM。
 
-* **[ ] 1.2 实现“视觉锚点”录制 (前端方案 A)**
-    * **做什么**：修改 `RecordingService`。
-    * **怎么做**：在用户录制 Demo 点击按钮的瞬间，前端利用 `html2canvas` 截取**被点击元素的小图 (Crop)**。
-    * **价值**：这是 SFT 的核武器。告诉模型：“以后看到长成这张图（Crop）样子的东西，就去点它，不管 ID 变成了什么。”
+* **[x] 1.2 实现“视觉锚点”录制 (前端方案)**
+    * **状态**：**已实装** (`coreui-angular/.../recording.service.ts`)
+    * **实现细节**：
+        * **异步采集**：`recordAction` 升级为 Async 模式，使用 `Promise.all` 并行捕获全屏截图和元素切图。
+        * **精准切图**：在 `AgentService` 中增加了 `captureElementCrop`，利用 `html2canvas` 对交互目标进行独立渲染。
+        * **SFT 准备**：现在每一条人类演示数据都包含 `(Context Image, Target Crop) -> Action` 的完整映射，直接满足多模态微调需求。
 
 ---
 
-#### 🔄 第二阶段：反馈闭环与样本分级 (Feedback Loop)
+### 🔄 第二阶段：反馈闭环与样本分级 (Feedback Loop) [NEXT STEP]
 **目标**：自动区分“好数据”和“坏数据”，为 RL (DPO) 准备正负样本。
 
 * **[ ] 2.1 捕获“负样本” (Negative Samples)**
@@ -39,14 +42,20 @@
         * Rejected: `ID 14` (坏数据，用于 DPO 惩罚)。
         * Chosen: `ID 15` (好数据，用于 DPO 奖励)。
 
-* **[ ] 2.2 捕获“正样本” (Positive Samples)**
+* **[x] 2.2 捕获“人工反馈” (Human Feedback)**
+    * **状态**：**后端逻辑已就绪** (`server.py` 中的 `if msg_type == 'feedback'`)
+    * **做什么**：前端已预留 👍/👎 按钮。
+    * **逻辑**：后端已能接收 `rating: 1/-1` 并将其存入 ChromaDB 的 `rl_feedback` 集合。
+    * **下一步**：需要在前端 UI 上更显眼地展示反馈按钮，并在自动任务结束后引导用户评价。
+
+* **[ ] 2.3 捕获“正样本” (Positive Samples)**
     * **做什么**：利用 `Task Completed` 信号。
     * **逻辑**：如果任务顺利跑通，将整个 Session 标记为 `High Quality Trajectory`。
 
 ---
 
-#### 🧠 第三阶段：离线知识蒸馏 (Offline Distillation)
-**目标**：把“图片”变成“知识”，实现你提到的方案 B。
+### 🧠 第三阶段：离线知识蒸馏 (Offline Distillation)
+**目标**：把“图片”变成“知识”，实现方案 B。
 
 * **[ ] 3.1 构建后台分析器 (Background Worker)**
     * **做什么**：在空闲时间，让 Qwen2.5-VL 重新看一遍刚才录制的“视觉锚点（小图）”。
@@ -56,17 +65,9 @@
 
 ---
 
-#### 🚀 第四阶段：实战微调 (Training / SFT)
+### 🚀 第四阶段：实战微调 (Training / SFT)
 **目标**：甩掉庞大的 RAG 和 Prompt，让小模型（3B/7B）内化这些能力。
 
 * **[ ] 4.1 数据格式转换器**
     * 把我们需要积累的 JSON/Image 数据，转换为 HuggingFace / Ollama 支持的微调格式 (如 `ShareGPT` 或 `Alpaca` 格式)。
-
----
-
-### 🏁 既然我们有了单子，先迈出第一步？
-
-我觉得 **[1.1 构建 `DatasetRecorder`]** 是当务之急。
-因为我们现在的每一次调试都在产生宝贵的数据（比如你刚才跑通的 Find Flags 和跑挂的 Select Two），如果现在不存下来，这些经验就浪费了。
-
-**您同意先从实现 `backend/dataset_recorder.py` 开始吗？**
+```
