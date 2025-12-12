@@ -519,9 +519,33 @@ async def websocket_endpoint(websocket: WebSocket):
                         print(f"🤖 Action: {action_json_str}")
                         await websocket.send_text(action_json_str)
 
+                # 🔥🔥 FEEDBACK LOOP IMPLEMENTATION 🔥🔥
                 if msg_type == 'feedback':
-                    # ... feedback logic ...
-                    pass
+                    rating = payload.get('rating') # 1 (Good) or -1 (Bad)
+                    action_data = payload.get('action') # The action JSON that was rated
+                    
+                    if rating and action_data:
+                        feedback_id = f"rl_{int(datetime.datetime.now().timestamp())}_{str(uuid.uuid4())[:8]}"
+                        print(f"👍/👎 Feedback Received: {rating} for action {action_data}")
+                        
+                        # Store in ChromaDB for RLHF / DPO
+                        rl_collection.add(
+                            documents=[json.dumps(action_data)],
+                            metadatas=[{
+                                "rating": rating,
+                                "timestamp": datetime.datetime.now().isoformat(),
+                                "source": "user_ui"
+                            }],
+                            ids=[feedback_id]
+                        )
+                        
+                        save_raw_log({
+                            "type": "feedback",
+                            "rating": rating,
+                            "target_action": action_data,
+                            "timestamp": datetime.datetime.now().isoformat()
+                        })
+                    continue
 
             except json.JSONDecodeError: pass
     except WebSocketDisconnect: pass
