@@ -80,10 +80,17 @@ export class RecordingService implements OnDestroy {
     this.eventListeners = [];
   }
 
-  private recordAction(type: string, el: HTMLElement, value: string = '') {
+  // 🔥 Async: Capture Full Context + Visual Crop
+  private async recordAction(type: string, el: HTMLElement, value: string = '') {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
 
     const desc = this.agentService.getElementDescription(el);
+    
+    // Parallel Execution for performance
+    const [context, cropBase64] = await Promise.all([
+        this.agentService.captureContext(),
+        this.agentService.captureElementCrop(el)
+    ]);
     
     const payload = {
       type: 'record_event',
@@ -92,10 +99,15 @@ export class RecordingService implements OnDestroy {
         value: value
       },
       element_desc: desc,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      
+      // Full Data for SFT
+      dom: context.dom,
+      screenshot: context.screenshot, // Full Screen
+      visual_crop: cropBase64         // Visual Anchor
     };
 
-    console.log(`[Recorder] Sending: ${type} on "${desc}" (Val: ${value})`);
+    console.log(`[Recorder] Sending: ${type} on "${desc}" (Val: ${value}) | Full+Crop Captured`);
     this.socket.send(JSON.stringify(payload));
   }
 

@@ -12,6 +12,30 @@ export class AgentService {
   constructor(private router: Router) {}
 
   // =========================================================================
+  // 📸 Visual Anchor Logic (New Feature)
+  // =========================================================================
+  async captureElementCrop(el: HTMLElement): Promise<string | null> {
+    if (!el || !this.isVisible(el)) return null;
+
+    try {
+      // Create a specific canvas for the element
+      const canvas = await html2canvas(el, {
+        backgroundColor: null, 
+        scale: 1,              
+        logging: false,
+        useCORS: true,         
+        allowTaint: true
+      });
+
+      // Quality 0.8 is sufficient for training
+      return canvas.toDataURL('image/jpeg', 0.8);
+    } catch (e) {
+      console.warn('⚠️ Failed to capture element crop:', e);
+      return null;
+    }
+  }
+
+  // =========================================================================
   // 🗺️ Sitemap & Structure Logic
   // =========================================================================
   public getRouteInfo() {
@@ -173,13 +197,9 @@ export class AgentService {
                     if (position === 'fixed' || position === 'sticky') {
                         
                         // 1. Calculate original position
-                        // Note: computed style 'top' might be 'auto', so we can't trust it fully.
-                        // But since we are freezing the current view, we want to freeze it exactly where it IS.
                         const rect = el.getBoundingClientRect(); 
                         
                         // 2. 🔥 CREATE SPACER (Crucial for Sticky) 🔥
-                        // If we turn a sticky/fixed element to absolute, it leaves the flow.
-                        // We must insert a dummy div to hold its place and push content down.
                         if (position === 'sticky') {
                             const spacer = clonedDoc.createElement('div');
                             spacer.style.display = style.display;
@@ -201,15 +221,11 @@ export class AgentService {
 
                         // 3. Freeze the element visually to Absolute
                         el.style.position = 'absolute';
-                        // Add scrollY because absolute is relative to document top
-                        // rect.top is relative to viewport top (which is what we want + scroll)
                         el.style.top = (rect.top + scrollY) + 'px'; 
                         el.style.left = (rect.left + scrollX) + 'px';
-                        
-                        // Lock dimensions to prevent collapse
                         el.style.width = rect.width + 'px'; 
                         el.style.height = rect.height + 'px';
-                        el.style.margin = '0'; // Margin is handled by the spacer or position
+                        el.style.margin = '0'; 
                         el.style.bottom = 'auto'; 
                         el.style.right = 'auto';
                         el.style.transform = 'none'; 
@@ -278,24 +294,20 @@ export class AgentService {
   // ⚙️ Scanning & Execution
   // =========================================================================
   
-  // 🔥 Strict Visibility Check
   private isElementTrulyVisible(el: HTMLElement): boolean {
       if (!el.offsetWidth || !el.offsetHeight) return false;
       const rect = el.getBoundingClientRect();
       
-      // 1. Viewport Check
       if (rect.bottom < 0 || rect.top > window.innerHeight || 
           rect.right < 0 || rect.left > window.innerWidth) {
           return false;
       }
 
-      // 2. CSS Check
       const style = window.getComputedStyle(el);
       if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity || '1') < 0.1) {
           return false;
       }
 
-      // 3. Occlusion Check
       const centerX = rect.left + rect.width / 2;
       const centerY = rect.top + rect.height / 2;
       

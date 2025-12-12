@@ -7,8 +7,13 @@ import uuid
 class DatasetRecorder:
     def __init__(self, base_dir="agent_datasets"):
         self.base_dir = base_dir
+        self.demo_assets_dir = os.path.join(self.base_dir, "demo_assets")
+        
         if not os.path.exists(self.base_dir):
             os.makedirs(self.base_dir)
+        if not os.path.exists(self.demo_assets_dir):
+            os.makedirs(self.demo_assets_dir)
+            
         self.current_session_dir = None
         self.current_session_id = None
 
@@ -35,20 +40,29 @@ class DatasetRecorder:
         self._append_jsonl("session_info.jsonl", meta)
         print(f"📼 Recording started: {self.current_session_dir}")
 
+    def save_demo_image(self, b64_str, filename):
+        """
+        Saves a detached image (full screen or crop) to demo_assets folder.
+        Returns the relative path.
+        """
+        if not b64_str: return None
+        try:
+            # Clean base64 header if present
+            if "," in b64_str:
+                b64_str = b64_str.split(",")[1]
+            
+            file_path = os.path.join(self.demo_assets_dir, filename)
+            with open(file_path, "wb") as f:
+                f.write(base64.b64decode(b64_str))
+                
+            return os.path.join("demo_assets", filename)
+        except Exception as e:
+            print(f"❌ Failed to save demo image {filename}: {e}")
+            return None
+
     def record_step(self, step_index, data_packet):
         """
         Saves all data for a single step (Screenshots, DOM, Prompt, Thought, Action).
-        
-        data_packet = {
-            "raw_screenshot": base64_str,
-            "marked_screenshot": base64_str,
-            "dom": str,
-            "prompt": str,       # Input to LLM
-            "response_raw": str, # Raw output (including <think>)
-            "action_json": dict, # Parsed action
-            "attempt": int,      # Retry count
-            "model": str         # Model name used
-        }
         """
         if not self.current_session_dir:
             print("⚠️ No active session to record.")
@@ -87,7 +101,7 @@ class DatasetRecorder:
         print(f"💾 Step {step_index} saved to dataset.")
 
     def _save_image(self, b64_str, filename):
-        """Decodes and saves base64 image."""
+        """Decodes and saves base64 image to current session dir."""
         if not b64_str: return None
         try:
             if "," in b64_str:

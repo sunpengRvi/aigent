@@ -7,6 +7,7 @@ import json
 import datetime
 import hashlib
 import uvicorn
+import uuid
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from openai import AsyncOpenAI
 import chromadb
@@ -397,8 +398,28 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 if msg_type == 'sitemap_init':
                     sitemap.sync_skeleton(payload.get('routes', []), payload.get('version', 'v1')); continue
+                
+                # 🔥🔥 RECORD EVENT HANDLER (FIXED: Save BOTH Screenshot & Crop)
                 if msg_type == 'record_event':
-                    current_recording_session.append(payload); save_raw_log(payload); continue
+                    
+                    # 1. Save Visual Anchor (Crop)
+                    if payload.get('visual_crop'):
+                        crop_b64 = payload.pop('visual_crop')
+                        filename_crop = f"crop_{int(datetime.datetime.now().timestamp())}_{str(uuid.uuid4())[:6]}.jpg"
+                        payload['crop_image_path'] = recorder.save_demo_image(crop_b64, filename_crop)
+                        print(f"📸 Visual Anchor saved: {filename_crop}")
+
+                    # 2. Save Full Screen Context (Screenshot)
+                    if payload.get('screenshot'):
+                        full_b64 = payload.pop('screenshot')
+                        filename_full = f"full_{int(datetime.datetime.now().timestamp())}_{str(uuid.uuid4())[:6]}.jpg"
+                        payload['full_image_path'] = recorder.save_demo_image(full_b64, filename_full)
+                        print(f"📸 Full Screen saved: {filename_full}")
+
+                    current_recording_session.append(payload)
+                    save_raw_log(payload)
+                    continue
+
                 if msg_type == 'request_preview':
                     await websocket.send_text(json.dumps({"action": "preview_data", "data": current_recording_session})); continue
                 if msg_type == 'save_demo':
