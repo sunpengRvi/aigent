@@ -343,6 +343,9 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
                 is_valid, real_text = verify_id_in_dom(target_id, dom_state)
                 if not is_valid: return json.dumps({"action": "message", "value": f"Error: ID {target_id} not found."})
                 
+                # 🔥 Semantic Action Logging: Reverse Lookup ID -> Text
+                print(f"🎯 Target Identified: [ID {target_id}] -> \"{real_text}\"")
+
                 action_type = res_json.get('action')
                 target_val = res_json.get('value', '')
 
