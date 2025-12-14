@@ -69,7 +69,7 @@ def clean_ai_response(content):
             return json.dumps({"action": "message", "value": "Task Completed"})
         if 'action' in data and '|' in data['action']:
             data['action'] = 'click'
-        if 'id' in data:
+        if 'id' in data and data['id']:
             match = re.search(r'(\d+)', str(data['id']))
             if match: data['id'] = match.group(1)
         if 'value' not in data:
@@ -94,6 +94,7 @@ def get_context_fingerprint(dom_str):
 def find_id_by_desc(desc, dom_str):
     if not desc: return None
     clean_desc = desc.replace("[Sidebar]", "").replace("[Header]", "").replace("[Active]", "").strip()
+    if not clean_desc: return None
     clean_desc = re.escape(clean_desc)
     pattern = re.compile(rf'\[(\d+)\]\s*<[^>]+>\s*".*?{clean_desc}.*?"', re.IGNORECASE)
     match = pattern.search(dom_str)
@@ -176,7 +177,7 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
         context_specific_bans = instant_bans_map.get(current_hash, set())
         
         # Fail Fast
-        max_allowed_steps = 10 
+        max_allowed_steps = 15 
         if len(history_logs) >= max_allowed_steps:
             return json.dumps({"action": "finish", "value": f"Task Failed: Step limit ({max_allowed_steps}) reached."})
 
@@ -193,23 +194,30 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
                 steps = json.loads(demo_results['metadatas'][0][0]['steps'])
                 total_steps = len(steps)
                 
-                cursor_idx = -1
-                for idx in range(total_steps - 1, -1, -1):
-                    step = steps[idx]
-                    desc = step.get('element_desc', '')
-                    if find_element_in_dom(desc, dom_state):
-                        cursor_idx = idx
-                        break 
-                if cursor_idx == -1: cursor_idx = len(history_logs)
+                # =========================================================
+                # 🔥 LOGIC UPDATE: Calculate Effective Progress (Audit Logs)
+                # =========================================================
+                effective_history_count = 0
+                for log in history_logs:
+                    l = log.lower()
+                    # Ignore non-advancing actions
+                    if "scroll" in l or "scan" in l: continue
+                    # Error means step failed, subtract count (retry)
+                    if "error" in l or "fail" in l: 
+                        effective_history_count = max(0, effective_history_count - 1)
+                        continue
+                    effective_history_count += 1
+                
+                cursor_idx = effective_history_count
 
-                # Zero-Click Check
+                # Zero-Click Check (Only at end)
                 if cursor_idx == total_steps - 1:
                     target_step = steps[cursor_idx]
                     desc = target_step.get('element_desc', '')
                     target_val = target_step.get('action', {}).get('value', '')
                     if user_goal.lower() == demo_task_name.lower():
                         if is_target_active_or_selected(desc, target_val, dom_state):
-                            # 🔥 Record Success Snapshot
+                            # Record Success
                             recorder.record_step(len(history_logs) + 1, {
                                 "raw_screenshot": raw_screenshot, "marked_screenshot": marked_screenshot, "dom": dom_state,
                                 "prompt": "System: Zero-Click Check", "response_raw": "Goal Active",
@@ -223,15 +231,27 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
                     action_type = target_step.get('action', {}).get('type')
                     desc = target_step.get('element_desc', 'unknown')
                     action_val = target_step.get('action', {}).get('value', '')
+                    
                     suggested_id = find_id_by_desc(desc, dom_state)
                     
                     demo_info = f"--- GUIDANCE (Step {cursor_idx + 1}/{total_steps}) ---\nAction: {action_type}\nTarget: \"{desc}\"\nValue: \"{action_val}\""
                     
+                    print(f"📚 [Memory] Following: '{demo_task_name}' (Step {cursor_idx + 1}/{total_steps})")
+                    
                     if suggested_id:
                         if str(suggested_id) in context_specific_bans:
                             demo_info += f"\n🚫 WARNING: ID {suggested_id} is BANNED/STUCK. Find visual alternative!"
+                            print(f"🚫 [Memory] ID {suggested_id} is banned.")
                         else:
                             demo_info += f"\n💡 HINT: Found at ID {suggested_id}."
+                            print(f"🎯 [Memory] Target visible at ID {suggested_id}")
+                    else:
+                        # 🔥 MISSING ELEMENT STRATEGY: SCROLL 🔥
+                        is_sidebar_target = "[Sidebar]" in desc
+                        scroll_target = "sidebar:down" if is_sidebar_target else "down"
+                        demo_info += f"\n⚠️ TARGET NOT VISIBLE IN DOM. Action required: 'scroll' (value: '{scroll_target}')."
+                        print(f"🔻 [Memory] Target '{desc}' NOT FOUND. Suggesting SCROLL ({scroll_target}).")
+
         except Exception as e: print(f"⚠️ RAG Error: {e}")
 
         instruction = "Use GUIDANCE. If banned, find alternative." if demo_info else "Use SITEMAP."
@@ -257,14 +277,16 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
             
             RULES:
             1. Find element matching GOAL. Use Numeric ID from RED BOX.
-            2. 'id' is MANDATORY.
+            2. 'id' is MANDATORY (unless action is scroll).
             3. 'select'/'type' actions MUST have 'value'.
-            4. BANNED IDs: {list(context_specific_bans)}.
+            4. If GUIDANCE says SCROLL, output action: "scroll", value: "down" (or "sidebar:down").
             {error_injection}
             
             OUTPUT JSON ONLY:
             ```json
             {{"action": "click", "id": "10", "value": ""}}
+            OR
+            {{"action": "scroll", "id": "", "value": "down"}}
             ```
             """
             
@@ -292,11 +314,13 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
             INSTRUCTIONS:
             1. Find ID matching GOAL.
             2. If <select>, action MUST be 'select'.
-            3. 'select'/'type' MUST have 'value'.
+            3. If MEMORY advises SCROLL, output action "scroll".
             
             FORMAT:
             ```json
             {{"action": "select", "id": "123", "value": "TargetValue"}}
+            OR
+            {{"action": "scroll", "id": "", "value": "down"}}
             ```
             """
             messages_payload = [
@@ -324,6 +348,10 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
                 })
 
                 if res_json.get('action') == 'message': return result_str
+                
+                # 🔥 Pass through SCROLL actions immediately
+                if res_json.get('action') == 'scroll':
+                    return json.dumps(res_json)
 
                 target_id = str(res_json.get('id', ''))
                 target_id = resolve_dom_id(target_id, dom_state)
@@ -343,7 +371,7 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
                 is_valid, real_text = verify_id_in_dom(target_id, dom_state)
                 if not is_valid: return json.dumps({"action": "message", "value": f"Error: ID {target_id} not found."})
                 
-                # 🔥 Semantic Action Logging: Reverse Lookup ID -> Text
+                # 🔥 Semantic Action Logging
                 print(f"🎯 Target Identified: [ID {target_id}] -> \"{real_text}\"")
 
                 action_type = res_json.get('action')
@@ -355,7 +383,6 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
                 # Loop Check
                 if history_logs:
                     last_log = history_logs[-1]
-                    # If same action repeated on same ID (and not a client error report)
                     if str(target_id) in last_log and action_type == 'click' and not last_log.startswith("❌"):
                         print(f"🔄 Loop detected. Banning...")
                         if current_hash not in instant_bans_map: instant_bans_map[current_hash] = set()
@@ -402,17 +429,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 if msg_type == 'sitemap_init':
                     sitemap.sync_skeleton(payload.get('routes', []), payload.get('version', 'v1')); continue
                 
-                # 🔥🔥 RECORD EVENT HANDLER (FIXED: Save BOTH Screenshot & Crop)
                 if msg_type == 'record_event':
-                    
-                    # 1. Save Visual Anchor (Crop)
                     if payload.get('visual_crop'):
                         crop_b64 = payload.pop('visual_crop')
                         filename_crop = f"crop_{int(datetime.datetime.now().timestamp())}_{str(uuid.uuid4())[:6]}.jpg"
                         payload['crop_image_path'] = recorder.save_demo_image(crop_b64, filename_crop)
                         print(f"📸 Visual Anchor saved: {filename_crop}")
 
-                    # 2. Save Full Screen Context (Screenshot)
                     if payload.get('screenshot'):
                         full_b64 = payload.pop('screenshot')
                         filename_full = f"full_{int(datetime.datetime.now().timestamp())}_{str(uuid.uuid4())[:6]}.jpg"
@@ -439,25 +462,20 @@ async def websocket_endpoint(websocket: WebSocket):
                         current_recording_session = [] 
                     continue
 
-                # 🔥🔥 HANDLE CLIENT ERROR (FIXED: Save Step & Use Fresh Screenshot)
                 if msg_type == 'client_error':
                     error_msg = payload.get('error')
                     print(f"🚨 Client reported error: {error_msg}")
                     
-                    # 1. Update History
                     session_step_history[session_id].append(error_msg)
                     
-                    # 2. Extract FRESH Context
                     dom_tree = payload.get("dom")
                     raw_screenshot = payload.get("screenshot") 
                     elements_meta = payload.get("elements_meta")
                     marked_screenshot_b64 = draw_grounding_marks(raw_screenshot, elements_meta)
                     
-                    # Get Goal from cache
                     ctx = last_context_cache.get(session_id, {})
                     user_msg = ctx.get('goal', 'Continue task')
 
-                    # 3. 🔥 RECORD THIS ERROR STEP
                     recorder.record_step(len(session_step_history[session_id]), {
                         "raw_screenshot": raw_screenshot, 
                         "marked_screenshot": marked_screenshot_b64, 
@@ -468,15 +486,14 @@ async def websocket_endpoint(websocket: WebSocket):
                         "attempt": 0, "model": "Frontend Guard"
                     })
 
-                    # 4. Immediate Retry with Fresh Screenshot
                     action_json_str = await ask_brain_task(
                         user_msg, 
                         dom_tree, 
                         session_id, 
                         session_step_history[session_id], 
                         session_blacklists[session_id],
-                        marked_screenshot=marked_screenshot_b64, # 🔥 Fresh Image
-                        raw_screenshot=raw_screenshot            # 🔥 Fresh Image
+                        marked_screenshot=marked_screenshot_b64, 
+                        raw_screenshot=raw_screenshot
                     )
                     
                     print(f"🤖 Correction Action: {action_json_str}")
@@ -518,11 +535,13 @@ async def websocket_endpoint(websocket: WebSocket):
                                     val = act_data.get('value', '')
                                     log = f"{act_data['action']} ID {act_data['id']} (Val: {val})"
                                     session_step_history[session_id].append(log)
+                            # 🔥 Also Log Scrolls
+                            if act_data.get('action') == 'scroll':
+                                session_step_history[session_id].append(f"scroll {act_data.get('value', 'down')}")
                         except: pass
                         print(f"🤖 Action: {action_json_str}")
                         await websocket.send_text(action_json_str)
 
-                # 🔥🔥 FEEDBACK LOOP IMPLEMENTATION 🔥🔥
                 if msg_type == 'feedback':
                     rating = payload.get('rating') # 1 (Good) or -1 (Bad)
                     action_data = payload.get('action') # The action JSON that was rated
@@ -531,7 +550,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         feedback_id = f"rl_{int(datetime.datetime.now().timestamp())}_{str(uuid.uuid4())[:8]}"
                         print(f"👍/👎 Feedback Received: {rating} for action {action_data}")
                         
-                        # Store in ChromaDB for RLHF / DPO
+                        # 1. Store in ChromaDB for RLHF / DPO
                         rl_collection.add(
                             documents=[json.dumps(action_data)],
                             metadatas=[{
@@ -542,6 +561,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             ids=[feedback_id]
                         )
                         
+                        # 2. [RESTORED] Save Raw Log to JSONL
                         save_raw_log({
                             "type": "feedback",
                             "rating": rating,

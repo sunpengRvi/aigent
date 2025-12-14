@@ -144,7 +144,8 @@ export class AgentChatComponent implements OnInit, OnDestroy {
             }
         }
       } 
-      else if (['click', 'type', 'select'].includes(cmd.action)) {
+      // 👇 [UPDATED] Added 'scroll' to the whitelist
+      else if (['click', 'type', 'select', 'scroll'].includes(cmd.action)) {
           const result = this.agentService.executeCommand(cmd.action, cmd.id, cmd.value);
           
           this.messages.push({
@@ -162,8 +163,7 @@ export class AgentChatComponent implements OnInit, OnDestroy {
             if (this.autoRunning) {
                 console.warn('[Agent] Runtime Error, requesting correction from backend...');
                 
-                // 🔥🔥 FIX: Re-capture context IMMEDIATELY for the retry
-                // This ensures the AI sees the EXACT current state (fixes offset issues)
+                // Re-capture context IMMEDIATELY for the retry
                 this.agentService.captureContext().then(contextData => {
                     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
                         this.socket.send(JSON.stringify({

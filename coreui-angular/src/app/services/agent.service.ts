@@ -442,8 +442,65 @@ export class AgentService {
     setTimeout(() => { el.style.outline = originalOutline; }, 1000);
   }
 
-  // 🔥 Runtime Guard
+  // 🔥 Runtime Guard & Executor
   executeCommand(action: string, id: string, value: string = ''): string {
+    // 👇 [UPDATED] Smart Scroll Logic
+    if (action === 'scroll') {
+        const val = value.toLowerCase();
+        let scrollContainer: Element | Window = window;
+        let containerName = "Window";
+
+        // 1. Smart Container Detection
+        if (val.startsWith('sidebar')) {
+            // Try to find the Sidebar Root
+            const sidebarRoot = document.querySelector('.sidebar, .c-sidebar, app-sidebar, c-sidebar');
+            
+            if (sidebarRoot) {
+                // A. Priority: ng-scrollbar viewport (Common in CoreUI / ngx-scrollbar)
+                const ngViewport = sidebarRoot.querySelector('.ng-scroll-viewport, .ng-native-scrollbar-hider, .ng-scroll-content');
+                
+                // B. Fallback: Any truly "overflowing" child
+                const scrollableChild = Array.from(sidebarRoot.querySelectorAll('div, ul, nav')).find(el => {
+                     const style = window.getComputedStyle(el);
+                     // Must be scrollable (content height > client height) AND have overflow enabled
+                     return (el.scrollHeight > el.clientHeight) && 
+                            (style.overflowY === 'auto' || style.overflowY === 'scroll' || style.overflowY === 'visible');
+                });
+
+                if (ngViewport) {
+                    scrollContainer = ngViewport;
+                    containerName = "Sidebar (ng-scrollbar)";
+                } else if (scrollableChild) {
+                    scrollContainer = scrollableChild;
+                    containerName = "Sidebar (Inner)";
+                } else {
+                    // Fallback to Root
+                    scrollContainer = sidebarRoot;
+                    containerName = "Sidebar (Root)";
+                }
+            } else {
+                return '❌ Error: Sidebar container not found';
+            }
+        }
+
+        // 2. Execute Scroll & Verify
+        const isUp = val.includes('up');
+        const amount = window.innerHeight * 0.6;
+        const behavior = 'smooth';
+        
+        // Record start position
+        const startTop = scrollContainer instanceof Window ? scrollContainer.scrollY : (scrollContainer as Element).scrollTop;
+
+        if (scrollContainer instanceof Window) {
+            scrollContainer.scrollBy({ top: isUp ? -amount : amount, behavior: behavior });
+        } else {
+            (scrollContainer as Element).scrollBy({ top: isUp ? -amount : amount, behavior: behavior });
+        }
+        
+        // 3. Return Verify Info
+        return `✅ Scrolled ${containerName} ${isUp ? 'Up' : 'Down'} (Start: ${Math.round(startTop)})`;
+    }
+
     const el = document.querySelector(`[data-agent-id="${id}"]`) as HTMLElement;
     if (!el) return `❌ ID [${id}] not found`;
     this.highlightElement(el);
