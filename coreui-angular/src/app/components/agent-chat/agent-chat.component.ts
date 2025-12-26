@@ -109,7 +109,7 @@ export class AgentChatComponent implements OnInit, OnDestroy {
     }
   }
 
-  handleIncomingMessage(jsonStr: string) {
+handleIncomingMessage(jsonStr: string) {
     try {
       const cmd = JSON.parse(jsonStr);
       const msgId = Date.now().toString();
@@ -130,7 +130,6 @@ export class AgentChatComponent implements OnInit, OnDestroy {
             text: text 
         });
         
-        // Stop Loop Condition
         if (this.autoRunning) {
             const lowerText = text.toLowerCase();
             if (
@@ -144,9 +143,29 @@ export class AgentChatComponent implements OnInit, OnDestroy {
             }
         }
       } 
-      // 👇 [UPDATED] Added 'scroll' to the whitelist
-      else if (['click', 'type', 'select', 'scroll'].includes(cmd.action)) {
-          const result = this.agentService.executeCommand(cmd.action, cmd.id, cmd.value);
+      // 👇 [UPDATED] Add 'crop' to the allowed actions list
+      else if (['click', 'type', 'select', 'scroll', 'crop'].includes(cmd.action)) {
+          
+          // [NEW] Special handling for 'crop' which is not in executeCommand (or add it there)
+          // Since executeCommand returns a string, we can implement crop inside AgentService 
+          // OR handle it here. 
+          // Let's assume you implemented 'crop' inside AgentService.executeCommand as well, 
+          // OR we handle it specifically here if AgentService doesn't support it yet.
+          
+          let result = '';
+          
+          if (cmd.action === 'crop') {
+              // Call the crop logic we discussed
+              // You might need to move the crop logic to AgentService to keep this component clean
+              // For now, let's assume AgentService.executeCommand handles it or returns a special string
+              // BUT, executeCommand returns a string synchronously. Crop is async.
+              // So we should handle crop separately here.
+              
+              this.handleCropAction(cmd.id); // <--- We need to implement this
+              result = `✂️ Cropping ID ${cmd.id}...`;
+          } else {
+              result = this.agentService.executeCommand(cmd.action, cmd.id, cmd.value);
+          }
           
           this.messages.push({
             id: msgId,
@@ -156,12 +175,10 @@ export class AgentChatComponent implements OnInit, OnDestroy {
             feedback: null
           });
 
-          // 🔥🔥 RUNTIME GUARD: Check for Execution Errors 🔥🔥
           if (result.startsWith('❌')) {
             this.messages.push({ id: msgId + '_fail', type: 'system', text: result });
-            
             if (this.autoRunning) {
-                console.warn('[Agent] Runtime Error, requesting correction from backend...');
+              console.warn('[Agent] Runtime Error, requesting correction from backend...');
                 
                 // Re-capture context IMMEDIATELY for the retry
                 this.agentService.captureContext().then(contextData => {
@@ -180,8 +197,7 @@ export class AgentChatComponent implements OnInit, OnDestroy {
                 this.stopAutoRun('Execution Error');
             }
           } else {
-            // Success case
-            if (this.autoRunning) {
+            if (this.autoRunning && cmd.action !== 'crop') { // Don't auto-advance on manual crop
               this.triggerNextStep();
             }
           }
@@ -190,6 +206,23 @@ export class AgentChatComponent implements OnInit, OnDestroy {
     } catch (e) {
       console.error(e);
     }
+  }
+
+  // [NEW] Helper method for Crop
+  async handleCropAction(id: string) {
+      const el = document.querySelector(`[data-agent-id="${id}"]`) as HTMLElement;
+      if (el) {
+          const base64 = await this.agentService.captureElementCrop(el);
+          if (base64 && this.socket) {
+              this.socket.send(JSON.stringify({
+                  type: 'save_crop_image',
+                  id: id,
+                  image: base64
+              }));
+          }
+      } else {
+          this.messages.push({ id: Date.now().toString(), type: 'system', text: `❌ Crop failed: ID ${id} not found` });
+      }
   }
 
   triggerNextStep() {
@@ -210,7 +243,7 @@ export class AgentChatComponent implements OnInit, OnDestroy {
     this.messages.push({ id: Date.now().toString(), type: 'user', text: cmd });
     this.inputText = '';
 
-    if (cmd.toLowerCase() === 'scan' && this.currentMode === 'task') {
+    if (cmd.toLowerCase() === '_scan' && this.currentMode === 'task') {
       const domSnapshot = this.agentService.scanPage();
       console.log(domSnapshot);
       this.messages.push({

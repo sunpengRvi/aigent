@@ -17,6 +17,11 @@ from image_utils import draw_grounding_marks
 from dataset_recorder import DatasetRecorder
 from brain_planner import PlannerBrain
 
+# Ensure directories exist
+CROP_DIR = "crop_screenshots"
+if not os.path.exists(CROP_DIR):
+    os.makedirs(CROP_DIR)
+
 # ==========================================
 # 1. Configuration & Initialization
 # ==========================================
@@ -53,34 +58,67 @@ session_blacklists = {}
 session_plans = {}
 
 # ==========================================
+# [Level 1] JSON Schema Definition (The "Cage")
+# ==========================================
+AGENT_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["click", "type", "select", "scroll", "finish", "error", "message"],
+            "description": "The type of action to perform."
+        },
+        "id": {
+            "type": "string",
+            "description": "The numeric ID of the target element (e.g., '15'). Mandatory for click/type/select."
+        },
+        "value": {
+            "type": "string",
+            "description": "The value to type, select, or scroll direction (e.g., 'down')."
+        },
+        "thought": {
+            "type": "string",
+            "description": "Reasoning about why this action was chosen."
+        }
+    },
+    "required": ["action", "id", "value"]
+}
+
+# ==========================================
 # 3. Helper Functions
 # ==========================================
 def clean_ai_response(content):
-    """Robustly extract JSON from AI response."""
+    """
+    Simplified parser for Schema-enforced output.
+    Now we trust the format, just handling edge cases.
+    """
     try:
-        print(f"\n🧠 [AI Reasoning Raw]:\n{content[:500]}...\n") 
-        if "<think>" in content:
+        # 1. 有些模型即便在 JSON 模式下，也会在 JSON 前面保留 <think>...</think>
+        # 我们先把 <think> 拿掉，只取最后的 JSON
+        if "</think>" in content:
             content = content.split("</think>")[-1].strip()
-        json_match = re.search(r'```json\s*(\{.*?\})\s*```', content, re.DOTALL)
+        
+        # 2. 如果模型还是顽皮地加了 Markdown code block，去掉它
+        json_match = re.search(r'(\{.*\})', content, re.DOTALL)
         if json_match:
             json_str = json_match.group(1)
         else:
-            matches = re.findall(r'(\{.*?\})', content, re.DOTALL)
-            if matches: json_str = matches[-1] 
-            else: return json.dumps({"action": "error", "value": "No JSON found"})
+            json_str = content
+
         data = json.loads(json_str)
-        if 'action' in data and data['action'] in ['finish', 'return', 'done']:
-            return json.dumps({"action": "message", "value": "Task Completed"})
-        if 'action' in data and '|' in data['action']:
-            data['action'] = 'click'
-        if 'id' in data and data['id']:
-            match = re.search(r'(\d+)', str(data['id']))
+        
+        # 3. 数据清洗 (兼容旧逻辑)
+        if 'id' in data:
+            # 确保 ID 是纯数字字符串
+            data['id'] = str(data['id']).strip()
+            # 如果模型输出了 "ID: 15" 这种格式，提取数字
+            match = re.search(r'(\d+)', data['id'])
             if match: data['id'] = match.group(1)
-        if 'value' not in data:
-            data['value'] = ""
+            
         return json.dumps(data)
+
     except Exception as e:
-        print(f"❌ Parse Error: {e}")
+        print(f"❌ JSON Parse Error (Even with Schema): {e}\nRaw: {content}")
         return json.dumps({"action": "error", "value": "JSON Parse Error"})
 
 def save_raw_log(data):
@@ -219,15 +257,11 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
                     steps = json.loads(demo_results['metadatas'][0][0]['steps'])
                     total_steps = len(steps)
 
-                    # =========================================================
-                    # 🔥 LOGIC UPDATE: Calculate Effective Progress (Audit Logs)
-                    # =========================================================
+                    # Calculate Effective Progress
                     effective_history_count = 0
                     for log in history_logs:
                         l = log.lower()
-                        # Ignore non-advancing actions
                         if "scroll" in l or "scan" in l: continue
-                        # Error means step failed, subtract count (retry)
                         if "error" in l or "fail" in l: 
                             effective_history_count = max(0, effective_history_count - 1)
                             continue
@@ -235,20 +269,13 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
 
                     cursor_idx = effective_history_count
 
-                    # Zero-Click Check (Only at end)
+                    # Zero-Click Check
                     if cursor_idx == total_steps - 1:
                         target_step = steps[cursor_idx]
                         desc = target_step.get('element_desc', '')
                         target_val = target_step.get('action', {}).get('value', '')
                         if user_goal.lower() == demo_task_name.lower():
                             if is_target_active_or_selected(desc, target_val, dom_state):
-                                # Record Success
-                                recorder.record_step(len(history_logs) + 1, {
-                                    "raw_screenshot": raw_screenshot, "marked_screenshot": marked_screenshot, "dom": dom_state,
-                                    "prompt": "System: Zero-Click Check", "response_raw": "Goal Active",
-                                    "action_json": {"action": "message", "value": "Task Completed"},
-                                    "attempt": 0, "model": "System"
-                                })
                                 return json.dumps({"action": "message", "value": "Task Completed (Goal Active)"})
 
                     if cursor_idx < total_steps:
@@ -258,24 +285,17 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
                         action_val = target_step.get('action', {}).get('value', '')
 
                         suggested_id = find_id_by_desc(desc, dom_state)
-
                         demo_info = f"--- GUIDANCE (Step {cursor_idx + 1}/{total_steps}) ---\nAction: {action_type}\nTarget: \"{desc}\"\nValue: \"{action_val}\""
-
-                        print(f"📚 [Memory] Following: '{demo_task_name}' (Step {cursor_idx + 1}/{total_steps})")
-
+                        
                         if suggested_id:
                             if str(suggested_id) in context_specific_bans:
                                 demo_info += f"\n🚫 WARNING: ID {suggested_id} is BANNED/STUCK. Find visual alternative!"
-                                print(f"🚫 [Memory] ID {suggested_id} is banned.")
                             else:
                                 demo_info += f"\n💡 HINT: Found at ID {suggested_id}."
-                                print(f"🎯 [Memory] Target visible at ID {suggested_id}")
                         else:
-                            # 🔥 MISSING ELEMENT STRATEGY: SCROLL 🔥
                             is_sidebar_target = "[Sidebar]" in desc
                             scroll_target = "sidebar:down" if is_sidebar_target else "down"
                             demo_info += f"\n⚠️ TARGET NOT VISIBLE IN DOM. Action required: 'scroll' (value: '{scroll_target}')."
-                            print(f"🔻 [Memory] Target '{desc}' NOT FOUND. Suggesting SCROLL ({scroll_target}).")
 
             except Exception as e: print(f"⚠️ RAG Error: {e}")
 
@@ -286,65 +306,19 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
         messages_payload = []
         used_model = ""
 
-        # 🔥 Error Injection
         error_injection = ""
         if last_error_context:
             error_injection = f"\n❌ CRITICAL FEEDBACK: {last_error_context}\n👉 CORRECTION REQUIRED: Fix this error immediately."
 
         if use_vision:
-            #print(f"👁️ Using Vision Brain ({VISION_MODEL_NAME})...")
-            #used_model = VISION_MODEL_NAME
-            #
-            ## 1. 定义 Prompt
-            #system_prompt = f"""
-            #You are a GUI Agent.
-            #GOAL: "{user_goal}"
-            #TASK: {instruction}
-            #INPUTS: Main Screenshot (Current State) + Reference Image (Target Look).
-            #
-            #RULES:
-            #1. Find element matching GOAL. Use Numeric ID from RED BOX.
-            #2. 'id' is MANDATORY (unless action is scroll).
-            #3. 'select'/'type' actions MUST have 'value'.
-            #
-            #👉 [VISUAL MATCHING RULE] (CRITICAL):
-            #- The second image provided is the "Reference Crop".
-            #- It shows EXACTLY what the target button/link looks like.
-            #- IGNORE the Sidebar "Button groups" text if the Reference Image shows a specific Radio Button or a specific icon.
-            #- Visual Similarity > Text Similarity.
-            #
-            #👉 [NAVIGATION RULE]:
-            #- [Group] items are strictly for expanding menus. 
-            #- [Link] items are the actual pages.
-            #- NEVER click a [Link] or [Group] that is marked "[Active]" or "class='active'".
-            #- IF the Plan says "Click Radio 2", IGNORE all [Sidebar] elements. Focus on the Main Content.
-#
-            #👉 [VISIBILITY RULE]:
-            #- IF the target (matching Reference Image) is NOT VISIBLE in the Main Screenshot:
-            #  1. DO NOT click the Sidebar again.
-            #  2. REQUIRED ACTION: output {{"action": "scroll", "value": "down"}}.
-#
-            #{error_injection}
-            #
-            #OUTPUT JSON ONLY:
-            #```json
-            #{{"action": "click", "id": "10", "value": ""}}
-            #OR
-            #{{"action": "scroll", "id": "", "value": "down"}}
-            #```
-            #"""
-
             print(f"👁️ Using Vision Brain ({VISION_MODEL_NAME})...")
             used_model = VISION_MODEL_NAME
             
-            banned_msg = ""
-
             system_prompt = f"""
             You are a GUI Agent.
             GOAL: "{user_goal}"
             TASK: {instruction}
             INPUTS: Main Screenshot (Current State) + Reference Image (Target Look).
-            {banned_msg}
             
             RULES:
             1. Find element matching GOAL. Use Numeric ID from RED BOX.
@@ -373,15 +347,12 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
             ```
             """
             
-            # ... (后续 user_content 构建代码保持不变) ...
-
-            # 2. 构建消息内容 (user_content)
             user_content = [
                 {"type": "text", "text": system_prompt},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{marked_screenshot}"}},
             ]
             
-            # 🔥 注入参考图 (如果有)
+            # 🔥 Inject Reference Image
             if reference_image:
                 print("🖼️ Injecting Reference Image into Vision Prompt...")
                 user_content.append({
@@ -393,13 +364,11 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
                     "image_url": {"url": f"data:image/jpeg;base64,{reference_image}"}
                 })
 
-            # 3. 注入 DOM 上下文
             user_content.append({
                 "type": "text", 
                 "text": f"Context DOM:\n{dom_state[:1500]}\n\nPlan Step: {forced_plan or 'None'}\n\nAnalyze images and output JSON."
             })
 
-            # 4. 🔥🔥🔥 关键修复：把构建好的 user_content 放入 messages_payload
             messages_payload = [
                 {
                     "role": "user",
@@ -422,11 +391,6 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
             2. If <select>, action MUST be 'select'.
             3. If MEMORY advises SCROLL, output action "scroll".
 
-            👉 [NAVIGATION RULE]:
-            - [Group] items are strictly for expanding/collapsing menus. Click them ONLY if you need to see what's inside.
-            - [Link] items are for navigation. If you see a [Link] matching your goal, click it directly.
-            - AVOID getting stuck clicking [Group] items repeatedly if they are already (Expanded).
-            
             👉 [VISIBILITY RULE] (CRITICAL):
             - Search the DOM for the text described in the GOAL or PLAN.
             - IF the text (e.g. "Radio 2") is NOT in the DOM/Context:
@@ -447,12 +411,12 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
             ]
 
         try:
-            # 🔥 Enable JSON Mode
+            # 🔥 [Level 1] Enforce Strict Schema
             response = await client.chat.completions.create(
                 model=used_model,
                 messages=messages_payload,
                 temperature=0.0,
-                response_format={"type": "json_object"} 
+                extra_body={"format": AGENT_OUTPUT_SCHEMA}
             )
             raw_response_content = response.choices[0].message.content
 
@@ -460,6 +424,11 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
             
             try:
                 res_json = json.loads(result_str)
+
+                # 🔥 [NEW] Print AI Reasoning
+                if 'thought' in res_json and res_json['thought']:
+                    print(f"\n🧠 [AI Thought]: {res_json['thought']}\n")
+
                 recorder.record_step(len(history_logs) + 1, {
                     "raw_screenshot": raw_screenshot, "marked_screenshot": marked_screenshot, "dom": dom_state,
                     "prompt": str(messages_payload), "response_raw": raw_response_content,
@@ -490,7 +459,6 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
                 is_valid, real_text = verify_id_in_dom(target_id, dom_state)
                 if not is_valid: return json.dumps({"action": "message", "value": f"Error: ID {target_id} not found."})
                 
-                # 🔥 Semantic Action Logging
                 print(f"🎯 Target Identified: [ID {target_id}] -> \"{real_text}\"")
 
                 action_type = res_json.get('action')
@@ -567,6 +535,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 if msg_type == 'request_preview':
                     await websocket.send_text(json.dumps({"action": "preview_data", "data": current_recording_session})); continue
+                
                 if msg_type == 'save_demo':
                     task_name = payload.get('name')
                     final_steps = payload.get('steps') or current_recording_session
@@ -619,8 +588,72 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_text(action_json_str)
                     continue
 
+                # 🔥 [NEW] 1. Handle Crop Image Upload
+                if msg_type == 'save_crop_image':
+                    try:
+                        b64_data = payload.get('image')
+                        target_id = payload.get('id', 'unknown')
+                        if b64_data:
+                            if "," in b64_data: b64_data = b64_data.split(",")[1]
+                            filename = f"{CROP_DIR}/crop_{target_id}_{int(datetime.datetime.now().timestamp())}.png"
+                            with open(filename, "wb") as f:
+                                f.write(base64.b64decode(b64_data))
+                            print(f"📸 Crop Saved: {filename}")
+                            await websocket.send_text(json.dumps({"action": "message", "value": f"✅ Screenshot saved: {filename}"}))
+                    except Exception as e:
+                        print(f"❌ Save Crop Failed: {e}")
+                    continue
+
                 if 'instruction' in payload:
                     user_msg = payload.get("instruction")
+
+                    if session_plans.get(session_id) == "FIND_DONE" and not payload.get("is_new_task"):
+                        session_plans[session_id] = None # Reset
+                        print("🛑 Visual Search Loop Terminated.")
+                        await websocket.send_text(json.dumps({"action": "finish", "value": "Target Found & Interaction Performed."}))
+                        continue
+
+                    # 🔥 [NEW] 2. Intercept '_crop' command
+                    crop_match = re.match(r'^_crop\s+(\d+)$', user_msg.strip(), re.IGNORECASE)
+                    if crop_match:
+                        target_id = crop_match.group(1)
+                        print(f"✂️  Manual Command: CROP ID {target_id}")
+                        direct_action = {
+                            "action": "crop",
+                            "id": target_id,
+                            "value": "snapshot"
+                        }
+                        await websocket.send_text(json.dumps(direct_action))
+                        continue 
+
+                    # 🔥 [MODIFIED] 3. Intercept '_find' command with optional text hint
+                    # Regex: _find <filename> [optional text hint]
+                    # Example: "_find crop_37.png Radio 2"
+                    find_match = re.match(r'^_find\s+([^\s]+)(?:\s+(.+))?$', user_msg.strip(), re.IGNORECASE)
+                    manual_ref_image = None
+                    
+                    if find_match:
+                        filename = find_match.group(1).strip()
+                        text_hint = find_match.group(2).strip() if find_match.group(2) else ""
+                        
+                        filepath = os.path.join(CROP_DIR, filename)
+                        
+                        if os.path.exists(filepath):
+                            print(f"🔎 Visual Search: Image='{filename}', Hint='{text_hint}'")
+                            with open(filepath, "rb") as f:
+                                manual_ref_image = base64.b64encode(f.read()).decode('utf-8')
+                            
+                            # 构建更强的 Prompt
+                            if text_hint:
+                                user_msg = f"Look at the Reference Image. Find the element that matches it visually AND contains the text '{text_hint}'. The Text match is MANDATORY. If you see the image but the text is wrong, DO NOT click. If not found, SCROLL."
+                            else:
+                                user_msg = f"Find the element that visually matches the reference image '{filename}' EXACTLY. Pay attention to ICON shape and surrounding borders. If not sure, SCROLL."
+                            
+                            mode = 'task' 
+                        else:
+                            await websocket.send_text(json.dumps({"action": "message", "value": f"❌ Error: Image {filename} not found"}))
+                            continue
+
                     dom_tree = payload.get("dom")
                     raw_screenshot = payload.get("screenshot") 
                     elements_meta = payload.get("elements_meta")
@@ -640,99 +673,134 @@ async def websocket_endpoint(websocket: WebSocket):
                             session_blacklists[session_id] = {} 
                             print("🔄 New Task Started")
                             recorder.start_new_session(user_msg)
-                            # ==========================================
-                            # 🔥 NEW: Generate Plan on Task Start
-                            # ==========================================
-                            print(f"🧠 [System 2] Generating Plan for: {user_msg}")
-                            await websocket.send_text(json.dumps({"action": "message", "value": "🧠 Thinking & Planning..."}))
                             
-                            skeleton = sitemap.get_skeleton()
-
-                            plan_data = await planner.generate_plan(user_msg, sitemap_context=str(skeleton[:2000]))
-                            
-                            if plan_data:
-                                # plan_data 现在是 [{"text": "...", "image": "..."}, ...]
-                                # 我们需要把它存起来
-                                session_plans[session_id] = {
-                                    "steps": plan_data, 
-                                    "current_idx": 0
-                                }
-                                # 只是为了展示给前端，拼一个字符串
-                                plan_str = "\n".join([f"{i+1}. {s['text']} {'(Has Image)' if s['image'] else ''}" for i, s in enumerate(plan_data)])
-                                print(f"✅ Plan Generated with Visuals:\n{plan_str}")
-                                await websocket.send_text(json.dumps({"action": "message", "value": f"Plan:\n{plan_str}"}))
+                            # ==========================================
+                            # 🔥 FIX: Skip Planning for '_find' mode
+                            # ==========================================
+                            if not find_match:
+                                print(f"🧠 [System 2] Generating Plan for: {user_msg}")
+                                await websocket.send_text(json.dumps({"action": "message", "value": "🧠 Thinking & Planning..."}))
+                                skeleton = sitemap.get_skeleton()
+                                plan_data = await planner.generate_plan(user_msg, sitemap_context=str(skeleton[:2000]))
+                                
+                                if plan_data:
+                                    session_plans[session_id] = {
+                                        "steps": plan_data, 
+                                        "current_idx": 0
+                                    }
+                                    plan_str = "\n".join([f"{i+1}. {s['text']} {'(Has Image)' if s['image'] else ''}" for i, s in enumerate(plan_data)])
+                                    print(f"✅ Plan Generated with Visuals:\n{plan_str}")
+                                    await websocket.send_text(json.dumps({"action": "message", "value": f"Plan:\n{plan_str}"}))
+                                else:
+                                    session_plans[session_id] = None
                             else:
-                                session_plans[session_id] = None
+                                print(f"⏩ Visual Search Mode: Skipping Plan Generation.")
+                                session_plans[session_id] = None 
                         
                         last_context_cache[session_id] = {"goal": user_msg, "dom_summary": dom_tree[:500], "full_dom": dom_tree}
                         
-                        #action_json_str = await ask_brain_task(
-                        #    user_msg, dom_tree, session_id, session_step_history[session_id], session_blacklists[session_id],
-                        #    marked_screenshot=marked_screenshot_b64, raw_screenshot=raw_screenshot,
-                        #    forced_plan=session_plans.get(session_id)
-                        #)
-                        current_plan_data = session_plans.get(session_id)
+                        # ==========================================
+                        # 🧠 Context Preparation (Fixing the Logic)
+                        # ==========================================
                         forced_plan_text = None
-                        ref_img_b64 = None
+                        final_ref_image = manual_ref_image 
                         
-                        if current_plan_data:
+                        current_plan_data = session_plans.get(session_id)
+
+                        if not find_match and current_plan_data:
                             idx = current_plan_data['current_idx']
                             steps = current_plan_data['steps']
+                            
                             if idx < len(steps):
                                 step_obj = steps[idx]
                                 forced_plan_text = step_obj['text']
-                                # 🔥 如果有图，转成 Base64
-                                if step_obj['image']:
-                                    ref_img_b64 = encode_image(step_obj['image'])
-                                    print(f"🖼️ Loaded Reference Image for step: {forced_plan_text}")
+                                
+                                # Use Plan Image if no manual override
+                                if not final_ref_image and step_obj['image']:
+                                    final_ref_image = encode_image(step_obj['image'])
+                                    print(f"🖼️ Using Visual Reference from Plan Step {idx+1}")
 
+                        # ==========================================
+                        # 🚀 Execute Brain
+                        # ==========================================
                         action_json_str = await ask_brain_task(
-                            user_msg, dom_tree, session_id, session_step_history[session_id], session_blacklists[session_id],
-                            marked_screenshot=marked_screenshot_b64, raw_screenshot=raw_screenshot,
-                            forced_plan=forced_plan_text,  # 现在只传单步的文本
-                            reference_image=ref_img_b64    # 🔥 [NEW] 传入参考图
+                            user_msg, 
+                            dom_tree, 
+                            session_id, 
+                            session_step_history[session_id], 
+                            session_blacklists[session_id],
+                            marked_screenshot=marked_screenshot_b64, 
+                            raw_screenshot=raw_screenshot,
+                            forced_plan=forced_plan_text, 
+                            reference_image=final_ref_image 
                         )
-                        
-                        # 🔥 成功后 Index + 1 的逻辑 (简单版)
-                        #if "Task Completed" not in action_json_str and "error" not in action_json_str:
-                        #     if current_plan_data: current_plan_data['current_idx'] += 1
 
                         # ==============================================================
-                        # 🔥 FIX: Step Advancement Logic (The "Check Confirmation" Logic)
+                        # 0. Unified Parsing
                         # ==============================================================
+                        act_data = {}
                         try:
                             act_data = json.loads(action_json_str)
-                            action_type = act_data.get('action')
-                            
-                            # 1. 如果是 Scroll，说明还在“寻找”阶段，进度条卡住不动
-                            if action_type == 'scroll':
-                                print(f"⏳ Step {session_plans[session_id]['current_idx'] + 1} Pending: Scrolling to find target...")
-                            
-                            # 2. 如果是 Click/Type/Select，说明“确认找到并执行”，进度条前进
-                            elif action_type in ['click', 'type', 'select']:
-                                # 简单校验：必须有 ID 或者是合法的坐标操作
-                                if act_data.get('id') or act_data.get('x'):
-                                    if current_plan_data: 
-                                        current_plan_data['current_idx'] += 1
-                                        print(f"✅ Step {current_plan_data['current_idx']} Confirmed. Advancing Plan.")
-                                        
-                            # 3. 其他情况 (如 message, error) 不处理
-                            
-                        except Exception as e:
-                            print(f"⚠️ Step Logic Error: {e}")
-                        # ==============================================================
+                        except: pass 
+
+                        action_type = act_data.get('action')
+                        target_id = act_data.get('id')
                         
+                        # ==============================================================
+                        # 1. Evidence Generation for _find
+                        # ==============================================================
+                        if find_match:
+                            try:
+                                if target_id and action_type in ['click', 'type', 'select']:
+                                    print(f"🎯 Visual Search: Target Found at ID {target_id}")
+                                    target_meta = [m for m in elements_meta if str(m['id']) == str(target_id)]
+                                    if target_meta:
+                                        found_b64 = draw_grounding_marks(raw_screenshot, target_meta, debug_save=False)
+                                        if found_b64:
+                                            save_path = "last_found.jpg"
+                                            if "," in found_b64: found_b64 = found_b64.split(",")[1]
+                                            with open(save_path, "wb") as f:
+                                                f.write(base64.b64decode(found_b64))
+                                            await websocket.send_text(json.dumps({
+                                                "action": "message", 
+                                                "value": f"✅ Found & Saved: {save_path}"
+                                            }))
+                                    print("🏁 Visual Search Action Generated. Scheduling Stop.")
+                                    session_plans[session_id] = "FIND_DONE"
+                            except Exception as e:
+                                print(f"⚠️ Failed to generate evidence: {e}")
+
+                        # ==============================================================
+                        # 2. Step Advancement Logic
+                        # ==============================================================
+                        if not find_match: 
+                            try:
+                                # A. Scroll = Searching
+                                if action_type == 'scroll':
+                                    idx = current_plan_data['current_idx'] + 1 if current_plan_data else '?'
+                                    print(f"⏳ Step {idx} Pending: Scrolling to find target...")
+                                
+                                # B. Action = Advance Plan
+                                elif action_type in ['click', 'type', 'select']:
+                                    if target_id or act_data.get('x'):
+                                        if current_plan_data: 
+                                            current_plan_data['current_idx'] += 1
+                                            print(f"✅ Step {current_plan_data['current_idx']} Action Generated. Advancing Plan.")
+                                            
+                            except Exception as e:
+                                print(f"⚠️ Step Logic Error: {e}")
+
+                        # ==============================================================
+                        # 3. History Logging
+                        # ==============================================================
                         try:
-                            act_data = json.loads(action_json_str)
-                            if act_data.get('action') in ['click', 'type', 'select']:
-                                if str(act_data.get('id')).isdigit():
-                                    val = act_data.get('value', '')
-                                    log = f"{act_data['action']} ID {act_data['id']} (Val: {val})"
-                                    session_step_history[session_id].append(log)
-                            # 🔥 Also Log Scrolls
-                            if act_data.get('action') == 'scroll':
+                            if action_type in ['click', 'type', 'select'] and str(target_id).isdigit():
+                                val = act_data.get('value', '')
+                                session_step_history[session_id].append(f"{action_type} ID {target_id} (Val: {val})")
+                            elif action_type == 'scroll':
                                 session_step_history[session_id].append(f"scroll {act_data.get('value', 'down')}")
                         except: pass
+                        
                         print(f"🤖 Action: {action_json_str}")
                         await websocket.send_text(action_json_str)
 
@@ -743,19 +811,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     if rating and action_data:
                         feedback_id = f"rl_{int(datetime.datetime.now().timestamp())}_{str(uuid.uuid4())[:8]}"
                         print(f"👍/👎 Feedback Received: {rating} for action {action_data}")
-                        
-                        # 1. Store in ChromaDB for RLHF / DPO
                         rl_collection.add(
                             documents=[json.dumps(action_data)],
-                            metadatas=[{
-                                "rating": rating,
-                                "timestamp": datetime.datetime.now().isoformat(),
-                                "source": "user_ui"
-                            }],
+                            metadatas=[{"rating": rating, "timestamp": datetime.datetime.now().isoformat(), "source": "user_ui"}],
                             ids=[feedback_id]
                         )
-                        
-                        # 2. [RESTORED] Save Raw Log to JSONL
                         save_raw_log({
                             "type": "feedback",
                             "rating": rating,
