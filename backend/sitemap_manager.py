@@ -187,3 +187,70 @@ class SitemapManager:
         if max_score > 2:
             return best_url, reason
         return None, ""
+# [NEW] Insert this method into SitemapManager class
+    def get_skeleton(self):
+        """
+        Returns a compressed text representation of the site structure 
+        (Global Nav + Known Pages) for the AI Planner.
+        """
+        lines = []
+        
+        # 1. Summarize Global Navigation (Sidebar)
+        # Format: "Sidebar: Parent -> Child -> Item"
+        nav_data = self.data.get("global_nav", {})
+        if nav_data:
+            lines.append("--- GLOBAL NAVIGATION (SIDEBAR) ---")
+            # Sort to make it deterministic
+            for item, parents in sorted(nav_data.items()):
+                if parents:
+                    # e.g. "Buttons -> Button Groups -> Click Me"
+                    path = " -> ".join(parents)
+                    lines.append(f"{path} -> {item}")
+                else:
+                    lines.append(f"{item}")
+
+        # 2. Summarize Known Pages
+        # Format: "#/dashboard (Dashboard)"
+        pages_data = self.data.get("pages", {})
+        if pages_data:
+            lines.append("\n--- KNOWN URLS ---")
+            for url, info in sorted(pages_data.items()):
+                title = info.get("title", "Untitled")
+                # Only show relevant pages (skip overly generic ones if list is huge)
+                lines.append(f"{url} | {title}")
+        
+        return "\n".join(lines)
+
+    # [NEW] Insert this method into SitemapManager class
+    def get_skeleton(self):
+        """
+        Returns a compressed text representation of the site structure 
+        (Global Nav + Known Pages) for the AI Planner.
+        """
+        lines = []
+        
+        # 1. Summarize Global Navigation (Sidebar)
+        # Format: "Sidebar: Parent -> Child -> Item"
+        nav_data = self.data.get("global_nav", {})
+        if nav_data:
+            lines.append("--- GLOBAL NAVIGATION (SIDEBAR) ---")
+            # Sort to make it deterministic
+            for item, parents in sorted(nav_data.items()):
+                if parents:
+                    # e.g. "Buttons -> Button Groups -> Click Me"
+                    path = " -> ".join(parents)
+                    lines.append(f"{path} -> {item}")
+                else:
+                    lines.append(f"{item}")
+
+        # 2. Summarize Known Pages
+        # Format: "#/dashboard (Dashboard)"
+        pages_data = self.data.get("pages", {})
+        if pages_data:
+            lines.append("\n--- KNOWN URLS ---")
+            for url, info in sorted(pages_data.items()):
+                title = info.get("title", "Untitled")
+                # Only show relevant pages (skip overly generic ones if list is huge)
+                lines.append(f"{url} | {title}")
+        
+        return "\n".join(lines)

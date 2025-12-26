@@ -8,12 +8,14 @@ import datetime
 import hashlib
 import uvicorn
 import uuid
+import base64
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from openai import AsyncOpenAI
 import chromadb
 from sitemap_manager import SitemapManager
 from image_utils import draw_grounding_marks
 from dataset_recorder import DatasetRecorder
+from brain_planner import PlannerBrain
 
 # ==========================================
 # 1. Configuration & Initialization
@@ -40,13 +42,15 @@ app = FastAPI()
 # Components
 sitemap = SitemapManager()
 recorder = DatasetRecorder()
+planner = PlannerBrain()
 
 # Runtime Cache
 current_recording_session = [] 
 last_context_cache = {}        
 session_step_history = {}      
 chat_history_cache = {}
-session_blacklists = {} 
+session_blacklists = {}
+session_plans = {}
 
 # ==========================================
 # 3. Helper Functions
@@ -84,6 +88,13 @@ def save_raw_log(data):
         if 'server_time' not in data: data['server_time'] = datetime.datetime.now().isoformat()
         with open(DATASET_FILE, "a", encoding="utf-8") as f: f.write(json.dumps(data, ensure_ascii=False) + "\n")
     except: pass
+
+def encode_image(image_path):
+    if not image_path or not os.path.exists(image_path): return None
+    try:
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+    except: return None
 
 def get_context_fingerprint(dom_str):
     if not dom_str: return "empty"
@@ -157,7 +168,7 @@ def is_target_active_or_selected(desc, target_val, dom_str):
 # ==========================================
 # 4. Core Brain A: Task Execution
 # ==========================================
-async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant_bans_map, marked_screenshot=None, raw_screenshot=None):
+async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant_bans_map, marked_screenshot=None, raw_screenshot=None, forced_plan=None, reference_image=None):
     
     # 🔄 RETRY LOOP
     MAX_RETRIES = 4
@@ -187,72 +198,86 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
 
         # RAG Logic
         demo_info = ""
-        try:
-            demo_results = demo_collection.query(query_texts=[user_goal], n_results=1)
-            if demo_results['documents'] and len(demo_results['documents'][0]) > 0:
-                demo_task_name = demo_results['documents'][0][0]
-                steps = json.loads(demo_results['metadatas'][0][0]['steps'])
-                total_steps = len(steps)
-                
-                # =========================================================
-                # 🔥 LOGIC UPDATE: Calculate Effective Progress (Audit Logs)
-                # =========================================================
-                effective_history_count = 0
-                for log in history_logs:
-                    l = log.lower()
-                    # Ignore non-advancing actions
-                    if "scroll" in l or "scan" in l: continue
-                    # Error means step failed, subtract count (retry)
-                    if "error" in l or "fail" in l: 
-                        effective_history_count = max(0, effective_history_count - 1)
-                        continue
-                    effective_history_count += 1
-                
-                cursor_idx = effective_history_count
+        
+        if forced_plan:
+            # [System 2 Mode] 如果有战略计划，直接使用计划作为指引
+            print(f"📜 [Planner] Using Generated Plan for Context")
+            demo_info = f"""
+            --- 🧠 MASTER PLAN (Derived from past experiences) ---
+            {forced_plan}
+            ------------------------------------------------------
+            INSTRUCTION: 
+            1. Review the MASTER PLAN above.
+            2. Infer your current progress based on the DOM and History.
+            3. Execute the NEXT step in the plan.
+            """
+        else:
+            try:
+                demo_results = demo_collection.query(query_texts=[user_goal], n_results=1)
+                if demo_results['documents'] and len(demo_results['documents'][0]) > 0:
+                    demo_task_name = demo_results['documents'][0][0]
+                    steps = json.loads(demo_results['metadatas'][0][0]['steps'])
+                    total_steps = len(steps)
 
-                # Zero-Click Check (Only at end)
-                if cursor_idx == total_steps - 1:
-                    target_step = steps[cursor_idx]
-                    desc = target_step.get('element_desc', '')
-                    target_val = target_step.get('action', {}).get('value', '')
-                    if user_goal.lower() == demo_task_name.lower():
-                        if is_target_active_or_selected(desc, target_val, dom_state):
-                            # Record Success
-                            recorder.record_step(len(history_logs) + 1, {
-                                "raw_screenshot": raw_screenshot, "marked_screenshot": marked_screenshot, "dom": dom_state,
-                                "prompt": "System: Zero-Click Check", "response_raw": "Goal Active",
-                                "action_json": {"action": "message", "value": "Task Completed"},
-                                "attempt": 0, "model": "System"
-                            })
-                            return json.dumps({"action": "message", "value": "Task Completed (Goal Active)"})
+                    # =========================================================
+                    # 🔥 LOGIC UPDATE: Calculate Effective Progress (Audit Logs)
+                    # =========================================================
+                    effective_history_count = 0
+                    for log in history_logs:
+                        l = log.lower()
+                        # Ignore non-advancing actions
+                        if "scroll" in l or "scan" in l: continue
+                        # Error means step failed, subtract count (retry)
+                        if "error" in l or "fail" in l: 
+                            effective_history_count = max(0, effective_history_count - 1)
+                            continue
+                        effective_history_count += 1
 
-                if cursor_idx < total_steps:
-                    target_step = steps[cursor_idx]
-                    action_type = target_step.get('action', {}).get('type')
-                    desc = target_step.get('element_desc', 'unknown')
-                    action_val = target_step.get('action', {}).get('value', '')
-                    
-                    suggested_id = find_id_by_desc(desc, dom_state)
-                    
-                    demo_info = f"--- GUIDANCE (Step {cursor_idx + 1}/{total_steps}) ---\nAction: {action_type}\nTarget: \"{desc}\"\nValue: \"{action_val}\""
-                    
-                    print(f"📚 [Memory] Following: '{demo_task_name}' (Step {cursor_idx + 1}/{total_steps})")
-                    
-                    if suggested_id:
-                        if str(suggested_id) in context_specific_bans:
-                            demo_info += f"\n🚫 WARNING: ID {suggested_id} is BANNED/STUCK. Find visual alternative!"
-                            print(f"🚫 [Memory] ID {suggested_id} is banned.")
+                    cursor_idx = effective_history_count
+
+                    # Zero-Click Check (Only at end)
+                    if cursor_idx == total_steps - 1:
+                        target_step = steps[cursor_idx]
+                        desc = target_step.get('element_desc', '')
+                        target_val = target_step.get('action', {}).get('value', '')
+                        if user_goal.lower() == demo_task_name.lower():
+                            if is_target_active_or_selected(desc, target_val, dom_state):
+                                # Record Success
+                                recorder.record_step(len(history_logs) + 1, {
+                                    "raw_screenshot": raw_screenshot, "marked_screenshot": marked_screenshot, "dom": dom_state,
+                                    "prompt": "System: Zero-Click Check", "response_raw": "Goal Active",
+                                    "action_json": {"action": "message", "value": "Task Completed"},
+                                    "attempt": 0, "model": "System"
+                                })
+                                return json.dumps({"action": "message", "value": "Task Completed (Goal Active)"})
+
+                    if cursor_idx < total_steps:
+                        target_step = steps[cursor_idx]
+                        action_type = target_step.get('action', {}).get('type')
+                        desc = target_step.get('element_desc', 'unknown')
+                        action_val = target_step.get('action', {}).get('value', '')
+
+                        suggested_id = find_id_by_desc(desc, dom_state)
+
+                        demo_info = f"--- GUIDANCE (Step {cursor_idx + 1}/{total_steps}) ---\nAction: {action_type}\nTarget: \"{desc}\"\nValue: \"{action_val}\""
+
+                        print(f"📚 [Memory] Following: '{demo_task_name}' (Step {cursor_idx + 1}/{total_steps})")
+
+                        if suggested_id:
+                            if str(suggested_id) in context_specific_bans:
+                                demo_info += f"\n🚫 WARNING: ID {suggested_id} is BANNED/STUCK. Find visual alternative!"
+                                print(f"🚫 [Memory] ID {suggested_id} is banned.")
+                            else:
+                                demo_info += f"\n💡 HINT: Found at ID {suggested_id}."
+                                print(f"🎯 [Memory] Target visible at ID {suggested_id}")
                         else:
-                            demo_info += f"\n💡 HINT: Found at ID {suggested_id}."
-                            print(f"🎯 [Memory] Target visible at ID {suggested_id}")
-                    else:
-                        # 🔥 MISSING ELEMENT STRATEGY: SCROLL 🔥
-                        is_sidebar_target = "[Sidebar]" in desc
-                        scroll_target = "sidebar:down" if is_sidebar_target else "down"
-                        demo_info += f"\n⚠️ TARGET NOT VISIBLE IN DOM. Action required: 'scroll' (value: '{scroll_target}')."
-                        print(f"🔻 [Memory] Target '{desc}' NOT FOUND. Suggesting SCROLL ({scroll_target}).")
+                            # 🔥 MISSING ELEMENT STRATEGY: SCROLL 🔥
+                            is_sidebar_target = "[Sidebar]" in desc
+                            scroll_target = "sidebar:down" if is_sidebar_target else "down"
+                            demo_info += f"\n⚠️ TARGET NOT VISIBLE IN DOM. Action required: 'scroll' (value: '{scroll_target}')."
+                            print(f"🔻 [Memory] Target '{desc}' NOT FOUND. Suggesting SCROLL ({scroll_target}).")
 
-        except Exception as e: print(f"⚠️ RAG Error: {e}")
+            except Exception as e: print(f"⚠️ RAG Error: {e}")
 
         instruction = "Use GUIDANCE. If banned, find alternative." if demo_info else "Use SITEMAP."
 
@@ -267,21 +292,79 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
             error_injection = f"\n❌ CRITICAL FEEDBACK: {last_error_context}\n👉 CORRECTION REQUIRED: Fix this error immediately."
 
         if use_vision:
+            #print(f"👁️ Using Vision Brain ({VISION_MODEL_NAME})...")
+            #used_model = VISION_MODEL_NAME
+            #
+            ## 1. 定义 Prompt
+            #system_prompt = f"""
+            #You are a GUI Agent.
+            #GOAL: "{user_goal}"
+            #TASK: {instruction}
+            #INPUTS: Main Screenshot (Current State) + Reference Image (Target Look).
+            #
+            #RULES:
+            #1. Find element matching GOAL. Use Numeric ID from RED BOX.
+            #2. 'id' is MANDATORY (unless action is scroll).
+            #3. 'select'/'type' actions MUST have 'value'.
+            #
+            #👉 [VISUAL MATCHING RULE] (CRITICAL):
+            #- The second image provided is the "Reference Crop".
+            #- It shows EXACTLY what the target button/link looks like.
+            #- IGNORE the Sidebar "Button groups" text if the Reference Image shows a specific Radio Button or a specific icon.
+            #- Visual Similarity > Text Similarity.
+            #
+            #👉 [NAVIGATION RULE]:
+            #- [Group] items are strictly for expanding menus. 
+            #- [Link] items are the actual pages.
+            #- NEVER click a [Link] or [Group] that is marked "[Active]" or "class='active'".
+            #- IF the Plan says "Click Radio 2", IGNORE all [Sidebar] elements. Focus on the Main Content.
+#
+            #👉 [VISIBILITY RULE]:
+            #- IF the target (matching Reference Image) is NOT VISIBLE in the Main Screenshot:
+            #  1. DO NOT click the Sidebar again.
+            #  2. REQUIRED ACTION: output {{"action": "scroll", "value": "down"}}.
+#
+            #{error_injection}
+            #
+            #OUTPUT JSON ONLY:
+            #```json
+            #{{"action": "click", "id": "10", "value": ""}}
+            #OR
+            #{{"action": "scroll", "id": "", "value": "down"}}
+            #```
+            #"""
+
             print(f"👁️ Using Vision Brain ({VISION_MODEL_NAME})...")
             used_model = VISION_MODEL_NAME
+            
+            banned_msg = ""
+
             system_prompt = f"""
             You are a GUI Agent.
             GOAL: "{user_goal}"
             TASK: {instruction}
-            INPUTS: Image with RED BOXES + WHITE IDs.
+            INPUTS: Main Screenshot (Current State) + Reference Image (Target Look).
+            {banned_msg}
             
             RULES:
             1. Find element matching GOAL. Use Numeric ID from RED BOX.
             2. 'id' is MANDATORY (unless action is scroll).
-            3. 'select'/'type' actions MUST have 'value'.
-            4. If GUIDANCE says SCROLL, output action: "scroll", value: "down" (or "sidebar:down").
-            {error_injection}
             
+            👉 [STRICT TEXT MATCHING] (CRITICAL):
+            - Read the text on the candidate element.
+            - Does it match "{user_goal}" or the Plan Step?
+            - Example: If Goal is "Radio 2" but ID 7 says "Button groups" -> NO MATCH.
+            - IF TEXT DOES NOT MATCH -> OUTPUT {{"action": "scroll", "value": "down"}}.
+
+            👉 [VISUAL VERIFICATION]:
+            - Look at the Reference Image. Is it a Radio Button (Round)? 
+            - Look at the candidate ID. Is it a Text Link?
+            - IF SHAPE MISMATCH -> OUTPUT {{"action": "scroll", "value": "down"}}.
+
+            👉 [SIDEBAR TRAP]:
+            - DO NOT click Sidebar links when looking for Page Content.
+            - If you are unsure, SCROLL.
+
             OUTPUT JSON ONLY:
             ```json
             {{"action": "click", "id": "10", "value": ""}}
@@ -290,14 +373,37 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
             ```
             """
             
+            # ... (后续 user_content 构建代码保持不变) ...
+
+            # 2. 构建消息内容 (user_content)
+            user_content = [
+                {"type": "text", "text": system_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{marked_screenshot}"}},
+            ]
+            
+            # 🔥 注入参考图 (如果有)
+            if reference_image:
+                print("🖼️ Injecting Reference Image into Vision Prompt...")
+                user_content.append({
+                    "type": "text", 
+                    "text": "⬇️ BELOW IS THE REFERENCE IMAGE (Target Look) ⬇️"
+                })
+                user_content.append({
+                    "type": "image_url", 
+                    "image_url": {"url": f"data:image/jpeg;base64,{reference_image}"}
+                })
+
+            # 3. 注入 DOM 上下文
+            user_content.append({
+                "type": "text", 
+                "text": f"Context DOM:\n{dom_state[:1500]}\n\nPlan Step: {forced_plan or 'None'}\n\nAnalyze images and output JSON."
+            })
+
+            # 4. 🔥🔥🔥 关键修复：把构建好的 user_content 放入 messages_payload
             messages_payload = [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "text", "text": system_prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{marked_screenshot}"}},
-                        {"type": "text", "text": f"Context:\n{dom_state[:1000]}\n\n{demo_info}\n\nAnalyze image and output JSON."}
-                    ]
+                    "content": user_content
                 }
             ]
         else:
@@ -315,7 +421,19 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
             1. Find ID matching GOAL.
             2. If <select>, action MUST be 'select'.
             3. If MEMORY advises SCROLL, output action "scroll".
+
+            👉 [NAVIGATION RULE]:
+            - [Group] items are strictly for expanding/collapsing menus. Click them ONLY if you need to see what's inside.
+            - [Link] items are for navigation. If you see a [Link] matching your goal, click it directly.
+            - AVOID getting stuck clicking [Group] items repeatedly if they are already (Expanded).
             
+            👉 [VISIBILITY RULE] (CRITICAL):
+            - Search the DOM for the text described in the GOAL or PLAN.
+            - IF the text (e.g. "Radio 2") is NOT in the DOM/Context:
+              1. DO NOT click a "similar" looking ID (like a documentation link).
+              2. YOU MUST SCROLL to find it.
+              3. Output: {{"action": "scroll", "value": "down"}}.
+
             FORMAT:
             ```json
             {{"action": "select", "id": "123", "value": "TargetValue"}}
@@ -337,6 +455,7 @@ async def ask_brain_task(user_goal, dom_state, session_id, history_logs, instant
                 response_format={"type": "json_object"} 
             )
             raw_response_content = response.choices[0].message.content
+
             result_str = clean_ai_response(raw_response_content)
             
             try:
@@ -513,20 +632,95 @@ async def websocket_endpoint(websocket: WebSocket):
                     is_new_task = payload.get("is_new_task", False)
                     if not dom_tree: await websocket.send_text(json.dumps({"action": "message", "value": "UI Error"})); continue
                     
-                    if mode == 'chat': await websocket.send_text(await ask_brain_chat(user_msg, dom_tree, session_id))
+                    if mode == 'chat': 
+                        await websocket.send_text(await ask_brain_chat(user_msg, dom_tree, session_id))
                     else:
                         if is_new_task:
                             session_step_history[session_id] = []
                             session_blacklists[session_id] = {} 
                             print("🔄 New Task Started")
                             recorder.start_new_session(user_msg)
+                            # ==========================================
+                            # 🔥 NEW: Generate Plan on Task Start
+                            # ==========================================
+                            print(f"🧠 [System 2] Generating Plan for: {user_msg}")
+                            await websocket.send_text(json.dumps({"action": "message", "value": "🧠 Thinking & Planning..."}))
+                            
+                            skeleton = sitemap.get_skeleton()
+
+                            plan_data = await planner.generate_plan(user_msg, sitemap_context=str(skeleton[:2000]))
+                            
+                            if plan_data:
+                                # plan_data 现在是 [{"text": "...", "image": "..."}, ...]
+                                # 我们需要把它存起来
+                                session_plans[session_id] = {
+                                    "steps": plan_data, 
+                                    "current_idx": 0
+                                }
+                                # 只是为了展示给前端，拼一个字符串
+                                plan_str = "\n".join([f"{i+1}. {s['text']} {'(Has Image)' if s['image'] else ''}" for i, s in enumerate(plan_data)])
+                                print(f"✅ Plan Generated with Visuals:\n{plan_str}")
+                                await websocket.send_text(json.dumps({"action": "message", "value": f"Plan:\n{plan_str}"}))
+                            else:
+                                session_plans[session_id] = None
                         
                         last_context_cache[session_id] = {"goal": user_msg, "dom_summary": dom_tree[:500], "full_dom": dom_tree}
                         
+                        #action_json_str = await ask_brain_task(
+                        #    user_msg, dom_tree, session_id, session_step_history[session_id], session_blacklists[session_id],
+                        #    marked_screenshot=marked_screenshot_b64, raw_screenshot=raw_screenshot,
+                        #    forced_plan=session_plans.get(session_id)
+                        #)
+                        current_plan_data = session_plans.get(session_id)
+                        forced_plan_text = None
+                        ref_img_b64 = None
+                        
+                        if current_plan_data:
+                            idx = current_plan_data['current_idx']
+                            steps = current_plan_data['steps']
+                            if idx < len(steps):
+                                step_obj = steps[idx]
+                                forced_plan_text = step_obj['text']
+                                # 🔥 如果有图，转成 Base64
+                                if step_obj['image']:
+                                    ref_img_b64 = encode_image(step_obj['image'])
+                                    print(f"🖼️ Loaded Reference Image for step: {forced_plan_text}")
+
                         action_json_str = await ask_brain_task(
                             user_msg, dom_tree, session_id, session_step_history[session_id], session_blacklists[session_id],
-                            marked_screenshot=marked_screenshot_b64, raw_screenshot=raw_screenshot
+                            marked_screenshot=marked_screenshot_b64, raw_screenshot=raw_screenshot,
+                            forced_plan=forced_plan_text,  # 现在只传单步的文本
+                            reference_image=ref_img_b64    # 🔥 [NEW] 传入参考图
                         )
+                        
+                        # 🔥 成功后 Index + 1 的逻辑 (简单版)
+                        #if "Task Completed" not in action_json_str and "error" not in action_json_str:
+                        #     if current_plan_data: current_plan_data['current_idx'] += 1
+
+                        # ==============================================================
+                        # 🔥 FIX: Step Advancement Logic (The "Check Confirmation" Logic)
+                        # ==============================================================
+                        try:
+                            act_data = json.loads(action_json_str)
+                            action_type = act_data.get('action')
+                            
+                            # 1. 如果是 Scroll，说明还在“寻找”阶段，进度条卡住不动
+                            if action_type == 'scroll':
+                                print(f"⏳ Step {session_plans[session_id]['current_idx'] + 1} Pending: Scrolling to find target...")
+                            
+                            # 2. 如果是 Click/Type/Select，说明“确认找到并执行”，进度条前进
+                            elif action_type in ['click', 'type', 'select']:
+                                # 简单校验：必须有 ID 或者是合法的坐标操作
+                                if act_data.get('id') or act_data.get('x'):
+                                    if current_plan_data: 
+                                        current_plan_data['current_idx'] += 1
+                                        print(f"✅ Step {current_plan_data['current_idx']} Confirmed. Advancing Plan.")
+                                        
+                            # 3. 其他情况 (如 message, error) 不处理
+                            
+                        except Exception as e:
+                            print(f"⚠️ Step Logic Error: {e}")
+                        # ==============================================================
                         
                         try:
                             act_data = json.loads(action_json_str)

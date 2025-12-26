@@ -332,7 +332,7 @@ export class AgentService {
       if (el.closest('.agent-chat-container') || el.tagName === 'VLAB-AGENT-CHAT') return;
       
       const tagName = el.tagName.toLowerCase();
-      const interactiveTags = ['a', 'button', 'input', 'select', 'textarea', 'summary', 'details'];
+      const interactiveTags = ['a', 'button', 'input', 'select', 'textarea', 'summary', 'details', 'label'];
       const interactiveRoles = ['button', 'link', 'checkbox', 'radio', 'textbox', 'listbox', 'combobox', 'menuitem', 'tab'];
       const role = el.getAttribute('role');
       const isInteractive = interactiveTags.includes(tagName) || (role && interactiveRoles.includes(role));
@@ -365,6 +365,14 @@ export class AgentService {
         const select = el as HTMLSelectElement;
         const selectedOption = select.options[select.selectedIndex];
         stateInfo = `[Selected: "${selectedOption ? selectedOption.text.trim() : select.value}"]`;
+      } else if (tagName === 'label') {
+          const prev = el.previousElementSibling;
+          if (prev && prev.tagName === 'INPUT') {
+              const inputPrev = prev as HTMLInputElement;
+              if (inputPrev.type === 'checkbox' || inputPrev.type === 'radio') {
+                   stateInfo = `[Checked: ${inputPrev.checked}]`;
+              }
+          }
       }
       report.push(`[${agentId}] <${tagName}${attrsStr}> "${finalDesc}" ${stateInfo}`);
     });
@@ -379,6 +387,19 @@ export class AgentService {
       let desc = accName;
       if (hierarchy) if (!accName.includes(hierarchy)) desc = `${hierarchy} > ${accName}`;
       if (structure) desc = `[${structure}] ${desc}`;
+      const info = this.detectElementType(el);
+      if (info.type === 'group') {
+          // 强制追加 [Group] 前缀和状态
+          desc = `[Group] ${desc} (${info.state || 'Toggle'})`;
+      } else if (info.type === 'link') {
+          // 强制追加 [Link] 前缀
+          desc = `[Link] ${desc}`;
+      } else if (info.type === 'input') {
+          // Input 保持原样，scanPage 里通常已经处理了 value
+      } else if (el.tagName === 'LABEL' && el.classList.contains('btn')) {
+          // Explicitly mark button-like labels
+          desc = `[Button] ${desc}`; 
+      }
       if (!desc || desc.trim() === '') desc = "Unnamed Element";
       if (desc.length > 150) desc = desc.substring(0, 150) + '...';
       return desc;
@@ -425,6 +446,54 @@ export class AgentService {
       depth++;
     }
     return paths.join(' > ');
+  }
+
+  private detectElementType(el: HTMLElement): { type: 'group' | 'link' | 'input' | 'button' | 'generic', state?: string } {
+      // 1. 向上查找最近的“语义容器” (处理点击 span 实际上是点击父级 row 的情况)
+      // 很多时候 aria-expanded 挂在父级的 tree-node 或 li 上
+      const container = el.closest('[aria-expanded], a, button, label') as HTMLElement || el;
+
+      // ==================================================
+      // 规则 A: 显式的折叠状态 (WAI-ARIA 标准)
+      // 适用于: MatTree, Bootstrap Accordion, CoreUI Sidebar, etc.
+      // ==================================================
+      if (container.hasAttribute('aria-expanded')) {
+          const isExpanded = container.getAttribute('aria-expanded') === 'true';
+          return { type: 'group', state: isExpanded ? 'Expanded' : 'Collapsed' };
+      }
+
+      // ==================================================
+      // 规则 B: 链接特征判断
+      // 适用于: 所有 standard <a> tag
+      // ==================================================
+      if (container.tagName === 'A') {
+          const href = container.getAttribute('href');
+          // 如果 href 是 "#", "javascript:void(0)", 或者空，通常它是折叠器(Group)
+          if (!href || href === '#' || href.startsWith('javascript')) {
+             return { type: 'group', state: 'Collapsed' }; // 默认假设
+          }
+          // 如果有具体的 URL (如 #/dashboard)，它绝对是跳转链接
+          return { type: 'link' };
+      }
+
+      // ==================================================
+      // 规则 C: 输入控件特征
+      // ==================================================
+      const tagName = container.tagName;
+      if (tagName === 'INPUT' || tagName === 'SELECT' || tagName === 'TEXTAREA') {
+          return { type: 'input' };
+      }
+
+      if (tagName === 'LABEL') {
+          // 如果 Label 长得像按钮 (CoreUI/Bootstrap 的 .btn 类)
+          if (container.classList.contains('btn')) {
+              return { type: 'button' };
+          }
+          // 普通 Label 视为 Input 的一部分
+          return { type: 'input' };
+      }
+
+      return { type: 'generic' };
   }
   
   private isVisible(el: HTMLElement): boolean {
@@ -510,6 +579,10 @@ export class AgentService {
     try {
       switch (action) {
         case 'click':
+          if (el.tagName === 'LABEL') {
+              el.click();
+              return `✅ Clicked Label "${shortDesc}"`;
+          }
           if (el instanceof HTMLSelectElement) {
               return `❌ Error: Element [${id}] is a <select> dropdown. 'click' will not change its value. You MUST use 'select' action with a 'value'.`;
           }
